@@ -29,10 +29,11 @@ from app.vision import VisionDetector
 
 
 class AssistantStateMachine:
-    def __init__(self, hid: ESP32HIDController, detector: VisionDetector, config: Dict[str, Any]):
+    def __init__(self, hid: ESP32HIDController, detector: VisionDetector, config: Dict[str, Any], logger: Optional[Any] = None):
         self.hid = hid
         self.detector = detector
         self.config = config
+        self.logger = logger
         self.steering = PDSteeringController(config)
 
         # Active State
@@ -49,6 +50,11 @@ class AssistantStateMachine:
         self.active_marker_score: float = 0.0
         self.active_scan_mode: str = "None"
         self.last_template_lock: Optional[Dict[str, Any]] = None
+
+        # Flight Recorder Telemetry & Vision State
+        self.last_telem_time: float = 0.0
+        self.prev_marker_visible: bool = False
+        self.prev_minimap_bearing_visible: bool = False
 
         # Navigation & Minimap Bearing
         self.active_road_following: bool = False
@@ -136,6 +142,46 @@ class AssistantStateMachine:
         self.config = new_config
         self.steering.config = new_config
 
+    def _maybe_emit_telemetry(self, now: float, minimap_present: bool, minimap_score: float, f_prompt: bool):
+        """Emits a 4 Hz compact telemetry snapshot while focused and unpaused."""
+        if not self.logger:
+            return
+        if now - self.last_telem_time < 0.25:
+            return
+        self.last_telem_time = now
+
+        if self.active_marker_centroid is not None:
+            err_x = self.active_marker_centroid[0] - 640
+            marker_str = f"{self.active_marker_type}({self.active_marker_score:.2f}, {self.active_scan_mode}) @{self.active_marker_centroid} err_x={err_x:+d}"
+        else:
+            marker_str = "None(0.00, NONE) @None err_x=None"
+
+        if self.minimap_quest_bearing is not None:
+            bearing_str = f"{math.degrees(self.minimap_quest_bearing):+.1f}deg"
+        else:
+            bearing_str = "None"
+
+        telem_str = (
+            f"state={self.current_state} nav={self.nav_mode} walk={self.hid.is_walking} | "
+            f"minimap={minimap_present}({minimap_score:.2f}) | "
+            f"marker={marker_str} | "
+            f"mini_bearing={bearing_str} | "
+            f"f_prompt={f_prompt} | "
+            f"motion={self.smooth_motion_score:.2f}"
+        )
+        self.logger.log_event("TELEM", telem_str)
+
+    def _set_lost_marker_phase(self, new_phase: str, reason: str = ""):
+        """Transitions lost-marker recovery phase and logs event."""
+        if self.lost_marker_phase != new_phase:
+            old_phase = self.lost_marker_phase
+            self.lost_marker_phase = new_phase
+            if self.logger:
+                msg = f"Lost-marker phase {old_phase} -> {new_phase}"
+                if reason:
+                    msg += f" ({reason})"
+                self.logger.log_event("NAV", msg)
+
     def process_frame(self, frame: np.ndarray, frame_half: np.ndarray, frame_idx: int):
         now = time.time()
         self.detected_party_size = self.detector.detect_party_size(frame)
@@ -147,8 +193,13 @@ class AssistantStateMachine:
 
         if not minimap_present:
             if self.current_state != STATE_DIALOGUE:
+                old_state = self.current_state
                 self.current_state = STATE_DIALOGUE
                 print(f"[STATE] Entered {STATE_DIALOGUE} (Minimap hidden, metric: {minimap_score:.3f})")
+                if self.logger:
+                    self.logger.log_event("STATE", f"{old_state} -> DIALOGUE (minimap_score={minimap_score:.3f})")
+                    if self.nav_mode != "ALIGN":
+                        self.logger.log_event("NAV", "Mode reset -> ALIGN (entered dialogue)")
                 self.hid.stop_all()
                 self.hid.release_lmb()
                 self.combat_consecutive_frames = 0
@@ -174,6 +225,7 @@ class AssistantStateMachine:
                 delay = dialogue_advance_delay() * (0.85 if self.has_active_choice else 1.0)
                 self.next_dialogue_f_time = now + delay
 
+            self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=False)
             self.previous_minimap_state = False
             return
 
@@ -201,6 +253,7 @@ class AssistantStateMachine:
             self.combat_largest_area = largest_area
 
             if self.current_state not in (STATE_COMBAT_AUTO, STATE_COMBAT_MANUAL):
+                old_state = self.current_state
                 self.current_state = STATE_COMBAT_AUTO
                 self.combat_start_time = now
                 self.melee_damage_stall_timer = now
@@ -213,18 +266,25 @@ class AssistantStateMachine:
                 self.hid.stop_walk()
                 self.hid.stop_all()
                 print(f"[STATE] Entered {STATE_COMBAT_AUTO} (Valid HP bars: {num_bars}, aspect ratio >= 5.5, elevated: {is_elevated})")
+                if self.logger:
+                    self.logger.log_event("STATE", f"{old_state} -> COMBAT_AUTO (num_bars={num_bars}, largest_area={largest_area:.1f}, elevated={is_elevated}, hp_bbox={hp_bbox})")
+                    if old_state != STATE_COMBAT_AUTO:
+                        self.logger.log_event("NAV", "Mode reset -> ALIGN (entered combat)")
 
             if self.current_state == STATE_COMBAT_AUTO and (now - self.combat_start_time > 45.0):
                 print(f"[STATE] Combat exceeded 45s threshold -> {STATE_COMBAT_MANUAL}")
                 self.current_state = STATE_COMBAT_MANUAL
                 self.hid.stop_all()
                 play_alert_chime(880, 300)
+                if self.logger:
+                    self.logger.log_event("STATE", f"COMBAT_AUTO -> COMBAT_MANUAL (combat_duration={now - self.combat_start_time:.1f}s > 45.0s)")
 
             if self.current_state == STATE_COMBAT_AUTO:
                 self._execute_auto_combat_step(now, is_elevated, int(largest_area))
             else:
                 self.hid.stop_all()
 
+            self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=False)
             self.previous_minimap_state = True
             return
 
@@ -240,12 +300,16 @@ class AssistantStateMachine:
                     self.hid.press_r()
                     self.is_aiming_bow = False
                     self.bow_substate = "AIM_IDLE"
+                old_state = self.current_state
                 self.current_state = STATE_NAVIGATE
                 self.nav_mode = "ALIGN"
                 self.needs_pitch_reset = True
                 self.combat_ended_time = now
                 self.pending_v_pulse_time = now + random.uniform(0.4, 0.8)
+                if self.logger:
+                    self.logger.log_event("STATE", f"{old_state} -> NAVIGATE (0 valid HP bars for 1.5s)")
 
+            self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=False)
             self.previous_minimap_state = True
             return
 
@@ -253,8 +317,13 @@ class AssistantStateMachine:
         # HIERARCHY LEVEL 3: CHEST_LOOT (Active Vacuum OR Confirmed Hollow Ring)
         # ----------------------------------------------------------------------
         if self.vacuum_active:
-            self.current_state = STATE_CHEST_LOOT
+            if self.current_state != STATE_CHEST_LOOT:
+                old_state = self.current_state
+                self.current_state = STATE_CHEST_LOOT
+                if self.logger:
+                    self.logger.log_event("STATE", f"{old_state} -> CHEST_LOOT (vacuum active)")
             self._execute_loot_vacuum_step(now, frame)
+            self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=False)
             self.previous_minimap_state = True
             return
 
@@ -266,7 +335,11 @@ class AssistantStateMachine:
 
         # Require >= 4 consecutive frames to eliminate false chest detours
         if self.sealed_chest_consecutive_frames >= 4 and ring_centroid:
-            self.current_state = STATE_CHEST_LOOT
+            if self.current_state != STATE_CHEST_LOOT:
+                old_state = self.current_state
+                self.current_state = STATE_CHEST_LOOT
+                if self.logger:
+                    self.logger.log_event("STATE", f"{old_state} -> CHEST_LOOT (sealed chest ring confirmed, ring_box={ring_box}, ring_centroid={ring_centroid})")
             self.nav_mode = "ALIGN"
             self.needs_pitch_reset = True
             self.active_chest_box = ring_box
@@ -275,7 +348,7 @@ class AssistantStateMachine:
 
             f_detected, _ = self.detector.detect_overworld_f_prompt(frame)
             if f_detected or cy >= 440:
-                self.start_loot_vacuum(now)
+                self.start_loot_vacuum(now, trigger_source="sealed_chest_approach")
             else:
                 dx, should_pause = self.steering.compute_steering(error_x, now)
                 if dx != 0:
@@ -285,23 +358,50 @@ class AssistantStateMachine:
                 else:
                     self.hid.start_walk()
 
+            self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_detected)
             self.previous_minimap_state = True
             return
         elif self.current_state == STATE_CHEST_LOOT and not self.vacuum_active:
             self.current_state = STATE_NAVIGATE
             self.active_chest_box = None
+            if self.logger:
+                self.logger.log_event("STATE", "CHEST_LOOT -> NAVIGATE (sealed chest ring lost)")
 
         # ----------------------------------------------------------------------
         # HIERARCHY LEVEL 4: NAVIGATE (Pure Template + Minimap Turn + Staged Unstuck)
         # ----------------------------------------------------------------------
-        self.current_state = STATE_NAVIGATE
-        self._execute_navigate_step(now, frame, frame_half, frame_idx)
+        if self.current_state != STATE_NAVIGATE:
+            old_state = self.current_state
+            self.current_state = STATE_NAVIGATE
+            if self.logger:
+                self.logger.log_event("STATE", f"{old_state} -> NAVIGATE")
+        self._execute_navigate_step(now, frame, frame_half, frame_idx, minimap_present, minimap_score)
         self.previous_minimap_state = True
 
     # ==========================================================================
     # Multi-Second Loot Vacuum Step
     # ==========================================================================
-    def start_loot_vacuum(self, now: float):
+    def start_loot_vacuum(self, now: float, trigger_source: str = "chest"):
+        """Initiates multi-second loot vacuum sequence."""
+        self.hid.stop_walk()
+        self.hid.press_f()
+        self.vacuum_active = True
+        self.nav_mode = "ALIGN"
+        self.needs_pitch_reset = True
+        self.vacuum_phase = "WAIT_ANIMATION"
+        self.vacuum_animation_end_time = now + 0.65
+        burst_duration = random.uniform(2.2, 2.8)
+        self.vacuum_burst_start_time = self.vacuum_animation_end_time
+        self.vacuum_burst_end_time = self.vacuum_animation_end_time + burst_duration
+        self.next_vacuum_f_time = self.vacuum_animation_end_time
+        self.vacuum_taps_count = 1
+        self.vacuum_wiggle_stage = 0
+        self.vacuum_drain_timeout = self.vacuum_burst_end_time + 4.0
+        old_state = self.current_state
+        self.current_state = STATE_CHEST_LOOT
+        if self.logger:
+            self.logger.log_event("STATE", f"{old_state} -> CHEST_LOOT (start_loot_vacuum triggered by {trigger_source})")
+        print(f"[LOOT VACUUM] Chest/loot triggered: waiting 0.65s lid animation then {burst_duration:.2f}s vacuum burst.")
         """Initiates multi-second loot vacuum sequence."""
         self.hid.stop_walk()
         self.hid.press_f()
@@ -513,7 +613,8 @@ class AssistantStateMachine:
     # Overworld Navigation (Pure Template + Minimap Turn + Staged Unstuck)
     # ==========================================================================
     def _execute_navigate_step(
-        self, now: float, frame: np.ndarray, frame_half: np.ndarray, frame_idx: int
+        self, now: float, frame: np.ndarray, frame_half: np.ndarray, frame_idx: int,
+        minimap_present: bool = True, minimap_score: float = 1.0
     ):
         # 1. Transition V pulse from Dialogue
         if not self.previous_minimap_state:
@@ -523,6 +624,8 @@ class AssistantStateMachine:
 
         if self.pending_v_pulse_time and now >= self.pending_v_pulse_time:
             self.hid.press_v()
+            if self.logger:
+                self.logger.log_event("NAV", "Dispatched 'V' pulse (post-dialogue transition)")
             self.pending_v_pulse_time = None
 
         # 2. Camera Pitch Reset for Mondstadt Elevation
@@ -530,6 +633,8 @@ class AssistantStateMachine:
             pitch_counts = int(self.config.get("default_pitch_up_counts", -30))
             if pitch_counts != 0:
                 self.hid.move_mouse(0, pitch_counts)
+                if self.logger:
+                    self.logger.log_event("NAV", f"Dispatched pitch reset upward (dy={pitch_counts})")
             self.needs_pitch_reset = False
 
         # 3. Overworld [F] Prompt Detection (Keycap + Dark Pill Strip)
@@ -541,8 +646,11 @@ class AssistantStateMachine:
                 # Situation A: Monster drops within 4.0s of combat end
                 if now - self.combat_ended_time <= 4.0:
                     print("[NAV] Monster drops detected post-combat -> starting loot vacuum.")
+                    if self.logger:
+                        self.logger.log_event("NAV", f"[F] prompt triggered: monster drops post-combat (ended {now - self.combat_ended_time:.2f}s ago <= 4.0s) -> starting loot vacuum")
                     self.show_overworld_f_box_until = now + 1.2
-                    self.start_loot_vacuum(now)
+                    self.start_loot_vacuum(now, trigger_source="post_combat_drops")
+                    self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=True)
                     return
 
                 # Situation B: Quest Target Arrival
@@ -552,6 +660,8 @@ class AssistantStateMachine:
 
                 if marker_recent and marker_centered:
                     print("[NAV] Arrived at quest target with [F] prompt -> single F tap.")
+                    if self.logger:
+                        self.logger.log_event("NAV", f"[F] prompt triggered: quest target arrival (marker_recent=True [dt={now - self.marker_last_seen_time:.2f}s], marker_centered=True [x={self.last_valid_marker_x}]) -> single F tap")
                     self.hid.press_f()
                     self.hid.stop_walk()
                     self.nav_mode = "ALIGN"
@@ -559,8 +669,17 @@ class AssistantStateMachine:
                     self.last_overworld_f_time = now
                     self.overworld_f_cooldown = 1.2
                     self.show_overworld_f_box_until = now + 1.2
+                    self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=True)
                     return
-                # Otherwise: ignore arbitrary overworld [F] prompts (NPCs, cooking pots, signs)
+                else:
+                    reasons = []
+                    if not marker_recent:
+                        reasons.append(f"marker_recent=False (dt={now - self.marker_last_seen_time:.2f}s > 3.5s)")
+                    if not marker_centered:
+                        err_str = f"err_x={abs(self.last_valid_marker_x - 640)}" if self.last_valid_marker_x is not None else "last_valid_marker_x=None"
+                        reasons.append(f"marker_centered=False ({err_str} > 135 px)")
+                    if self.logger:
+                        self.logger.log_event("NAV", f"[F] prompt ignored (NPC/interactable): {', '.join(reasons)}")
         else:
             self.f_prompt_consecutive_frames = 0
 
@@ -579,12 +698,16 @@ class AssistantStateMachine:
                 stall_duration = now - self.unstuck_still_start_time
                 if stall_duration >= 0.8 and self.unstuck_stage == 0:
                     print(f"[UNSTUCK] Stage 1: Stall duration {stall_duration:.1f}s -> SPACE hop")
+                    if self.logger:
+                        self.logger.log_event("UNSTUCK", f"Stage 1 triggered: ground motion stall {stall_duration:.2f}s >= 0.8s (motion={self.smooth_motion_score:.2f}) -> SPACE hop")
                     self.hid.press_space()
                     self.unstuck_stage = 1
                 elif stall_duration >= 1.7 and self.unstuck_stage == 1:
                     print(f"[UNSTUCK] Stage 2: Stall duration {stall_duration:.1f}s -> W0 + lateral turn + W1 + SPACE")
-                    self.hid.stop_walk()
                     lateral_dx = 70 if random.random() < 0.5 else -70
+                    if self.logger:
+                        self.logger.log_event("UNSTUCK", f"Stage 2 triggered: ground motion stall {stall_duration:.2f}s >= 1.7s -> W0 + lateral turn {lateral_dx} + W1 + SPACE")
+                    self.hid.stop_walk()
                     self.hid.move_mouse(lateral_dx, 0)
                     self.hid.start_walk()
                     self.hid.press_space()
@@ -600,6 +723,17 @@ class AssistantStateMachine:
         self.active_road_following = has_road
         self.minimap_quest_bearing = quest_bearing
 
+        if quest_bearing is not None:
+            if not self.prev_minimap_bearing_visible:
+                self.prev_minimap_bearing_visible = True
+                if self.logger:
+                    self.logger.log_event("VISION", f"Minimap quest bearing DETECTED: {math.degrees(quest_bearing):+.1f} deg (blip_type={blip_type})")
+        else:
+            if self.prev_minimap_bearing_visible:
+                self.prev_minimap_bearing_visible = False
+                if self.logger:
+                    self.logger.log_event("VISION", "Minimap quest bearing LOST")
+
         # 6. Hybrid Quest Tracking (Template Matching + Direct Diamond HSV & Dark Outline)
         centroid, marker_type, bbox, score, scan_mode = self.detector.track_quest_marker(
             frame, self.config, frame_idx, self.last_template_lock
@@ -614,10 +748,16 @@ class AssistantStateMachine:
         drift_corridor = int(self.config.get("cruise_drift_corridor", 95))
 
         if centroid is not None:
+            cx, cy = centroid
+            raw_error_x = cx - 640
+            if not self.prev_marker_visible:
+                self.prev_marker_visible = True
+                if self.logger:
+                    self.logger.log_event("VISION", f"3D quest marker ACQUIRED: type={marker_type}, scan_mode={scan_mode}, score={score:.2f}, pos={centroid}, err_x={raw_error_x:+d}")
             self.marker_last_seen_time = now
             self.last_valid_marker_x = centroid[0]
             self.is_scanning_for_marker = False
-            self.lost_marker_phase = "IDLE"
+            self._set_lost_marker_phase("IDLE", "marker visible")
             self.lost_marker_start_time = 0.0
             self.lost_marker_step_count = 0
             self.last_template_lock = {
@@ -626,9 +766,11 @@ class AssistantStateMachine:
                 "bbox": bbox,
                 "score": score,
             }
-            cx, cy = centroid
-            raw_error_x = cx - 640
         else:
+            if self.prev_marker_visible:
+                self.prev_marker_visible = False
+                if self.logger:
+                    self.logger.log_event("VISION", f"3D quest marker LOST (last_seen_x={self.last_valid_marker_x})")
             self.last_template_lock = None
             cx, cy = None, None
             raw_error_x = None
@@ -660,6 +802,8 @@ class AssistantStateMachine:
 
             if should_exit_cruise:
                 print(f"[NAV] Exiting CRUISE_LOCKED -> ALIGN: {exit_reason}")
+                if self.logger:
+                    self.logger.log_event("NAV", f"Mode CRUISE_LOCKED -> ALIGN (exit_reason: {exit_reason})")
                 self.nav_mode = "ALIGN"
                 self.hid.stop_walk()
                 # Fall through to ALIGN handling below to begin steering immediately
@@ -678,6 +822,7 @@ class AssistantStateMachine:
                         self.hid.send_command("W1")
 
                 # LOCK OUT ALL CAMERA PANNING (dx = 0): No mouse steering commands sent
+                self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
                 return
 
         # ----------------------------------------------------------------------
@@ -691,10 +836,13 @@ class AssistantStateMachine:
             if centroid is not None:
                 if abs(raw_error_x) <= deadzone:
                     print(f"[NAV] Aligned with 3D marker (|{raw_error_x}| <= {deadzone} px) -> CRUISE_LOCKED")
+                    if self.logger:
+                        self.logger.log_event("NAV", f"Mode ALIGN -> CRUISE_LOCKED (aligned with 3D marker, |err_x|={abs(raw_error_x)} <= {deadzone} px)")
                     self.nav_mode = "CRUISE_LOCKED"
                     self.cruise_source = "3D"
                     if not self.vacuum_active:
                         self.hid.start_walk()
+                    self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
                     return
 
                 # Subtle road-following bias if marker is distant/off-center
@@ -715,12 +863,13 @@ class AssistantStateMachine:
                     self.scan_sweep_direction = 1
                 elif raw_error_x < -20:
                     self.scan_sweep_direction = -1
+                self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
                 return
 
             # Case 2: 3D Marker off-screen, Minimap Quest Bearing Present
             elif quest_bearing is not None:
                 self.is_scanning_for_marker = False
-                self.lost_marker_phase = "IDLE"
+                self._set_lost_marker_phase("IDLE", "minimap bearing active")
                 self.lost_marker_start_time = 0.0
                 self.lost_marker_step_count = 0
 
@@ -730,27 +879,33 @@ class AssistantStateMachine:
                 v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
                 if time_lost > v_delay and (now - self.last_quest_v_pulse_time >= v_cooldown):
                     self.hid.press_v()
+                    if self.logger:
+                        self.logger.log_event("NAV", f"Dispatched 'V' pulse (occluded marker, lost for {time_lost:.2f}s > {v_delay}s)")
                     self.last_quest_v_pulse_time = now
                     print(f"[NAV] Quest marker occluded ({time_lost:.2f}s > {v_delay}s): dispatched 'V' pulse.")
 
                 bearing_deg = abs(math.degrees(quest_bearing))
                 if bearing_deg <= 20.0:
                     print(f"[NAV] Aligned with minimap bearing ({bearing_deg:.1f} deg <= 20 deg) -> CRUISE_LOCKED")
+                    if self.logger:
+                        self.logger.log_event("NAV", f"Mode ALIGN -> CRUISE_LOCKED (aligned with minimap bearing {bearing_deg:.1f} deg <= 20.0 deg)")
                     self.nav_mode = "CRUISE_LOCKED"
                     self.cruise_source = "MINIMAP"
                     if not self.vacuum_active:
                         self.hid.start_walk()
+                    self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
                     return
 
                 pivot_dx, _ = self.steering.compute_minimap_pivot(quest_bearing, now)
                 if pivot_dx != 0:
                     self.hid.move_mouse(pivot_dx, 0)
+                self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
                 return
 
             # Case 3: Lost Marker 4-Phase Recovery Routine (No Endless Rotation)
             else:
                 if self.lost_marker_phase == "IDLE":
-                    self.lost_marker_phase = "WAIT_INITIAL"
+                    self._set_lost_marker_phase("WAIT_INITIAL", "start recovery")
                     self.lost_marker_start_time = now
                     self.lost_marker_step_count = 0
 
@@ -759,14 +914,16 @@ class AssistantStateMachine:
                         v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
                         if now - self.last_quest_v_pulse_time >= v_cooldown:
                             self.hid.press_v()
+                            if self.logger:
+                                self.logger.log_event("NAV", "Dispatched 'V' pulse (lost marker recovery Phase 1)")
                             self.last_quest_v_pulse_time = now
                             print("[NAV] Lost marker: dispatched 'V' pulse.")
-                        self.lost_marker_phase = "WAIT_V_PULSE"
+                        self._set_lost_marker_phase("WAIT_V_PULSE", "0.8s wait expired")
                         self.lost_marker_start_time = now
 
                 elif self.lost_marker_phase == "WAIT_V_PULSE":
                     if now - self.lost_marker_start_time >= 1.0:
-                        self.lost_marker_phase = "STEP_SWEEP"
+                        self._set_lost_marker_phase("STEP_SWEEP", "1.0s wait expired")
                         self.lost_marker_step_count = 0
                         self.last_step_sweep_time = now
 
@@ -781,14 +938,18 @@ class AssistantStateMachine:
                         else:
                             print(f"[NAV] Completed 8-step scan sweep ({self.lost_marker_step_count}/8). Stopping rotation.")
                             self.is_scanning_for_marker = False
-                            self.lost_marker_phase = "SWEEP_COMPLETE"
+                            self._set_lost_marker_phase("SWEEP_COMPLETE", "8 steps completed")
 
                 elif self.lost_marker_phase == "SWEEP_COMPLETE":
                     self.is_scanning_for_marker = False
                     v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
                     if now - self.last_quest_v_pulse_time >= v_cooldown:
                         self.hid.press_v()
+                        if self.logger:
+                            self.logger.log_event("NAV", "Dispatched 'V' pulse (lost marker recovery Phase 4 cooldown expired)")
                         self.last_quest_v_pulse_time = now
                         print("[NAV] V cooldown expired in idle: dispatched 'V' pulse.")
-                        self.lost_marker_phase = "WAIT_V_PULSE"
+                        self._set_lost_marker_phase("WAIT_V_PULSE", "cooldown expired")
                         self.lost_marker_start_time = now
+
+                self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)

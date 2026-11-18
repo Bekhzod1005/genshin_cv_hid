@@ -34,6 +34,8 @@ except ImportError:
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 os.makedirs(ASSETS_DIR, exist_ok=True)
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
 MINIMAP_TEMPLATE_PATH = os.path.join(ASSETS_DIR, "minimap_border.png")

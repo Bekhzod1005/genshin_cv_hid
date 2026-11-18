@@ -49,6 +49,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import time
+import json
 import argparse
 from typing import Optional, Tuple, Dict, Any
 
@@ -91,6 +92,7 @@ if HAS_WIN32:
 from app.controller import ESP32HIDController
 from app.vision import VisionDetector
 from app.state_machine import AssistantStateMachine
+from app.flight_logger import FlightLogger
 
 
 def find_genshin_window() -> Tuple[int, Optional[Dict[str, int]]]:
@@ -131,10 +133,23 @@ class GenshinAssistantApp:
         self.dry_run = dry_run
         self.capture_icon_mode = capture_icon_mode
 
+        self.logger = FlightLogger()
         self.config = load_config()
-        self.hid = ESP32HIDController(port=self.port, dry_run=self.dry_run)
+        self.hid = ESP32HIDController(port=self.port, dry_run=self.dry_run, logger=self.logger)
         self.detector = VisionDetector()
-        self.sm = AssistantStateMachine(self.hid, self.detector, self.config)
+        self.sm = AssistantStateMachine(self.hid, self.detector, self.config, logger=self.logger)
+
+        self.prev_is_focused: Optional[bool] = None
+
+        # Log [BOOT] metadata
+        gold_dim = f"{self.detector.quest_gold_template.shape[1]}x{self.detector.quest_gold_template.shape[0]}" if self.detector.quest_gold_template is not None else "None"
+        blue_dim = f"{self.detector.quest_blue_template.shape[1]}x{self.detector.quest_blue_template.shape[0]}" if self.detector.quest_blue_template is not None else "None"
+        mini_dim = f"{self.detector.minimap_template.shape[1]}x{self.detector.minimap_template.shape[0]}" if self.detector.minimap_template is not None else "None"
+        choice_dim = f"{self.detector.choice_template.shape[1]}x{self.detector.choice_template.shape[0]}" if self.detector.choice_template is not None else "None"
+
+        self.logger.log_event("BOOT", f"Genshin Assistant v5 started | Port={self.port} | DryRun={self.dry_run}")
+        self.logger.log_event("BOOT", f"Loaded Templates: quest_gold.png={gold_dim}, quest_blue.png={blue_dim}, minimap_border.png={mini_dim}, choice_icon.png={choice_dim}")
+        self.logger.log_event("BOOT", f"Active Configuration: {json.dumps(self.config, sort_keys=True)}")
 
         # Global Pause State
         self.global_paused = False
@@ -155,6 +170,8 @@ class GenshinAssistantApp:
                 self.global_paused = not self.global_paused
                 status = "PAUSED" if self.global_paused else "RESUMED"
                 print(f"\n[HOTKEY F12] Automation {status} by user.")
+                if self.logger:
+                    self.logger.log_event("PAUSE", f"Global pause toggled via F12: {status}")
                 if self.global_paused:
                     self.hid.stop_all()
                     self.sm.combat_consecutive_frames = 0
@@ -272,6 +289,12 @@ class GenshinAssistantApp:
                     # 1. Window Discovery & Focus Check
                     hwnd, client_rect = find_genshin_window()
                     is_focused = is_genshin_focused(hwnd) if hwnd != 0 else False
+
+                    if self.prev_is_focused is None or is_focused != self.prev_is_focused:
+                        status_str = "FOCUSED (Genshin Impact active)" if is_focused else "UNFOCUSED (Genshin Impact in background)"
+                        if self.logger:
+                            self.logger.log_event("FOCUS", f"Window focus changed: {status_str} [hwnd={hwnd}]")
+                        self.prev_is_focused = is_focused
 
                     # 2. Capture Screen Frame
                     frame = None
@@ -628,6 +651,8 @@ class GenshinAssistantApp:
             cv2.destroyAllWindows()
         except Exception:
             pass
+        if getattr(self, "logger", None):
+            self.logger.close()
         print("[CLEANUP] Genshin Assistant terminated safely.")
 
 

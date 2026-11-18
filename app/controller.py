@@ -14,10 +14,11 @@ import serial
 class ESP32HIDController:
     """Manages serial protocol communication with the ESP32-S3 TinyUSB HID firmware."""
 
-    def __init__(self, port: str = "COM4", baud: int = 115200, dry_run: bool = False):
+    def __init__(self, port: str = "COM4", baud: int = 115200, dry_run: bool = False, logger: Optional[Any] = None):
         self.port = port
         self.baud = baud
         self.dry_run = dry_run
+        self.logger = logger
         self.ser: Optional[serial.Serial] = None
         self.is_walking: bool = False
         self.walk_start_time: float = 0.0
@@ -48,6 +49,23 @@ class ESP32HIDController:
     def send_command(self, cmd: str):
         """Send a newline-terminated command string to the microcontroller."""
         self.last_command_time = time.time()
+
+        if self.logger and cmd != "PING":
+            extra = ""
+            if cmd == "W1":
+                extra = " [start walk]"
+            elif cmd == "W0":
+                extra = " [stop walk]"
+            elif cmd == "STOP":
+                extra = " [emergency stop all]"
+            elif cmd == "LMB_HOLD":
+                extra = " [hold lmb]"
+            elif cmd == "LMB_REL":
+                extra = " [release lmb]"
+            elif cmd.startswith("M"):
+                extra = " [camera move]"
+            self.logger.log_event("HID", f"TX -> {cmd}{extra}")
+
         if self.dry_run:
             return
         with self.lock:

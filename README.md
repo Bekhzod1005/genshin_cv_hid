@@ -53,6 +53,11 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
    - **Expanded Navigation ROI:** Extended `ROI_NAV` upper boundary from $y_1 = 100$ to $y_1 = 65$ (`(65, 540, 190, 1090)`) to acquire cliffside and hilltop waypoints earlier.
    - **Initial Upward Tilt (`default_pitch_up_counts: -30`):** Automatically dispatches an upward camera tilt (`M0,-30`) upon navigation startup or after returning from dialogue, combat, or window pause.
 
+3. **Flight Recorder Telemetry Logger (`logs/run_YYYYMMDD_HHMMSS.txt`):**
+   - **Thread-Safe & Line-Buffered:** Automatically initializes a line-buffered (`buffering=1`) diagnostic trace in `logs/` on startup and flushes each event without I/O stalling.
+   - **Synchronized Event Logging:** Logs `[BOOT]` (config & templates), `[FOCUS]`, `[PAUSE]`, `[HID]` (outgoing serial packets, skipping PINGs), `[STATE]` (transitions with metrics), `[NAV]` (mode shifts, lost-marker phases, V pulses, F prompt triggers/ignores), `[VISION]` (3D marker & minimap bearing acquisition/loss), and `[UNSTUCK]` (stage 1 & 2 recovery).
+   - **4 Hz Compact Telemetry Heartbeat:** Periodically emits single-line `[TELEM]` snapshots while focused and unpaused capturing state, nav mode, walking status, minimap confidence, marker position/error, minimap bearing, F prompt, and ground motion.
+
 ---
 
 ## v5.1 Architecture & Runtime Regression Overhaul
@@ -116,6 +121,7 @@ genshin_cv_hid/
 │   ├── __init__.py           # Package exports
 │   ├── config_manager.py     # Constants, ROIs, defaults, and config I/O
 │   ├── controller.py         # ESP32HIDController + PDSteeringController
+│   ├── flight_logger.py      # Thread-safe line-buffered Flight Recorder Telemetry Logger
 │   ├── vision.py             # VisionDetector (concentric templates, minimap, chest, prompt)
 │   ├── state_machine.py      # AssistantStateMachine (hierarchy, unstuck, non-blocking combat)
 │   ├── main.py               # Application entrypoint, capture loop, HUD rendering
