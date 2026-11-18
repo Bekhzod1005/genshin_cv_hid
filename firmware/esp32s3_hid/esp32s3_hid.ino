@@ -1,5 +1,5 @@
 /*
- * ESP32-S3 Native USB HID Keyboard & Mouse Controller for Genshin Impact CV Assistant
+ * ESP32-S3 Native USB HID Keyboard & Mouse Controller for Genshin Impact CV Assistant (v4)
  * 
  * Hardware:
  *   ESP32-S3 (e.g. ESP32-S3-DevKitC-1 or compatible)
@@ -12,23 +12,31 @@
  *   USB Firmware MSC:   "Disabled"
  *   Upload Mode:        "UART0 / Hardware CDC" (or "USB-OTG")
  * 
+ * Non-Blocking v4 Features:
+ *   - Zero-delay non-blocking millis() release table (MAX_TAPS = 6)
+ *   - Serial.setRxBufferSize(512) for smooth packet streaming
+ *   - Decoupled hold states: W0 releases 'w' only; LMB_REL releases mouse only
+ *   - Micro-stepped mouse movement (max 16 counts, 1200us spacing)
+ *   - 12-second hardware safety watchdog
+ * 
  * Protocol (Newline-terminated ASCII commands):
  *   PING           -> Replies "PONG\n"
- *   1, 2, 3, 4     -> Character slot select (random hold 48-112 ms)
- *   E              -> Elemental Skill (random hold 48-112 ms)
- *   Q              -> Elemental Burst (random hold 48-112 ms)
- *   R              -> Aiming Mode Toggle for Bow (random hold 45-85 ms)
- *   F              -> Interact / Dialogue / Loot (random hold 48-112 ms)
- *   V              -> Quest path trace (random hold 48-112 ms)
- *   SPACE          -> Jump / Glide / Unfreeze (random hold 48-112 ms)
- *   LMB            -> Left Mouse Click / Normal Attack (random hold 48-112 ms)
+ *   1, 2, 3, 4     -> Character slot select (random hold 48-112 ms, non-blocking)
+ *   E              -> Elemental Skill (random hold 48-112 ms, non-blocking)
+ *   Q              -> Elemental Burst (random hold 48-112 ms, non-blocking)
+ *   R              -> Aiming Mode Toggle for Bow (random hold 45-85 ms, non-blocking)
+ *   F              -> Interact / Dialogue / Loot (random hold 48-112 ms, non-blocking)
+ *   V              -> Quest path trace (random hold 48-112 ms, non-blocking)
+ *   SPACE          -> Jump / Glide / Unfreeze (random hold 48-112 ms, non-blocking)
+ *   LMB            -> Left Mouse Click / Normal Attack (random hold 48-112 ms, non-blocking)
  *   LMB_HOLD       -> Press & hold Left Mouse Button (Charged Attack / Aim Shot start)
  *   LMB_REL        -> Release Left Mouse Button (Charged Attack / Aim Shot fire)
- *   RMB            -> Right Mouse Click / Dash / Dodge (random hold 48-112 ms)
+ *   RMB            -> Right Mouse Click / Dash / Dodge (random hold 48-112 ms, non-blocking)
  *   W1             -> Hold 'w' key down (continuous forward movement)
- *   W0 / STOP      -> Immediately release all keyboard keys and mouse buttons
- *   M<dx>          -> Relative horizontal mouse move (clamped [-50, 50])
- *   M<dx>,<dy>     -> Relative 2-axis mouse move (clamped [-50, 50])
+ *   W0             -> Release 'w' key only (continuous forward movement pause)
+ *   STOP           -> Immediately release all keyboard keys, mouse buttons, and queues
+ *   M<dx>          -> Smooth relative horizontal mouse move (micro-stepped <= 16 counts)
+ *   M<dx>,<dy>     -> Smooth relative 2-axis mouse move (micro-stepped <= 16 counts)
  */
 
 #include "USB.h"
@@ -43,29 +51,165 @@ const size_t CMD_BUF_SIZE = 64;
 char cmdBuffer[CMD_BUF_SIZE];
 size_t cmdIndex = 0;
 
-// Safety watchdog: auto-release keys if no command is received for 15 seconds while keys/buttons are held
+// Non-blocking release scheduler table
+enum TapType {
+  TAP_NONE = 0,
+  TAP_KEYBOARD,
+  TAP_MOUSE_BUTTON
+};
+
+struct ScheduledRelease {
+  bool active;
+  TapType type;
+  uint8_t target;
+  unsigned long releaseAt;
+};
+
+const int MAX_TAPS = 6;
+ScheduledRelease tapQueue[MAX_TAPS];
+
+// Decoupled hold states
+bool isWalking = false;
+bool isLmbHeld = false;
+
+// Safety watchdog: auto-release all if no command is received for 12 seconds while keys/buttons are held
 unsigned long lastCommandTime = 0;
-bool isKeyHeld = false;
-const unsigned long WATCHDOG_TIMEOUT_MS = 15000;
+const unsigned long WATCHDOG_TIMEOUT_MS = 12000;
+
+void scheduleKeyTap(char key, unsigned long holdMs) {
+  // If this key is already active in queue, extend its release timestamp
+  for (int i = 0; i < MAX_TAPS; i++) {
+    if (tapQueue[i].active && tapQueue[i].type == TAP_KEYBOARD && tapQueue[i].target == (uint8_t)key) {
+      tapQueue[i].releaseAt = millis() + holdMs;
+      return;
+    }
+  }
+
+  // Find an inactive slot
+  for (int i = 0; i < MAX_TAPS; i++) {
+    if (!tapQueue[i].active) {
+      Keyboard.press(key);
+      tapQueue[i].active = true;
+      tapQueue[i].type = TAP_KEYBOARD;
+      tapQueue[i].target = (uint8_t)key;
+      tapQueue[i].releaseAt = millis() + holdMs;
+      return;
+    }
+  }
+
+  // If queue is completely full, evict slot 0 immediately to prevent stalling
+  if (tapQueue[0].type == TAP_KEYBOARD) {
+    Keyboard.release((char)tapQueue[0].target);
+  } else if (tapQueue[0].type == TAP_MOUSE_BUTTON) {
+    Mouse.release(tapQueue[0].target);
+  }
+  Keyboard.press(key);
+  tapQueue[0].active = true;
+  tapQueue[0].type = TAP_KEYBOARD;
+  tapQueue[0].target = (uint8_t)key;
+  tapQueue[0].releaseAt = millis() + holdMs;
+}
+
+void scheduleMouseTap(uint8_t button, unsigned long holdMs) {
+  // If this button is already active in queue, extend its release timestamp
+  for (int i = 0; i < MAX_TAPS; i++) {
+    if (tapQueue[i].active && tapQueue[i].type == TAP_MOUSE_BUTTON && tapQueue[i].target == button) {
+      tapQueue[i].releaseAt = millis() + holdMs;
+      return;
+    }
+  }
+
+  // Find an inactive slot
+  for (int i = 0; i < MAX_TAPS; i++) {
+    if (!tapQueue[i].active) {
+      Mouse.press(button);
+      tapQueue[i].active = true;
+      tapQueue[i].type = TAP_MOUSE_BUTTON;
+      tapQueue[i].target = button;
+      tapQueue[i].releaseAt = millis() + holdMs;
+      return;
+    }
+  }
+
+  // If queue is completely full, evict slot 0 immediately to prevent stalling
+  if (tapQueue[0].type == TAP_KEYBOARD) {
+    Keyboard.release((char)tapQueue[0].target);
+  } else if (tapQueue[0].type == TAP_MOUSE_BUTTON) {
+    Mouse.release(tapQueue[0].target);
+  }
+  Mouse.press(button);
+  tapQueue[0].active = true;
+  tapQueue[0].type = TAP_MOUSE_BUTTON;
+  tapQueue[0].target = button;
+  tapQueue[0].releaseAt = millis() + holdMs;
+}
+
+void pollScheduledReleases() {
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_TAPS; i++) {
+    if (tapQueue[i].active && (long)(now - tapQueue[i].releaseAt) >= 0) {
+      if (tapQueue[i].type == TAP_KEYBOARD) {
+        Keyboard.release((char)tapQueue[i].target);
+      } else if (tapQueue[i].type == TAP_MOUSE_BUTTON) {
+        Mouse.release(tapQueue[i].target);
+      }
+      tapQueue[i].active = false;
+    }
+  }
+}
+
+void clearScheduledReleases() {
+  for (int i = 0; i < MAX_TAPS; i++) {
+    if (tapQueue[i].active) {
+      if (tapQueue[i].type == TAP_KEYBOARD) {
+        Keyboard.release((char)tapQueue[i].target);
+      } else if (tapQueue[i].type == TAP_MOUSE_BUTTON) {
+        Mouse.release(tapQueue[i].target);
+      }
+      tapQueue[i].active = false;
+    }
+  }
+}
+
+// Micro-stepped mouse movement: chunks of max 16 counts spaced 1200us apart
+void moveMouseSmooth(int totalDx, int totalDy) {
+  int remX = constrain(totalDx, -50, 50);
+  int remY = constrain(totalDy, -50, 50);
+
+  while (remX != 0 || remY != 0) {
+    int stepX = constrain(remX, -16, 16);
+    int stepY = constrain(remY, -16, 16);
+
+    Mouse.move((int8_t)stepX, (int8_t)stepY);
+    remX -= stepX;
+    remY -= stepY;
+
+    if (remX != 0 || remY != 0) {
+      delayMicroseconds(1200);
+    }
+  }
+}
 
 void setup() {
   // Seed random generator with ESP32-S3 hardware true RNG
   randomSeed(esp_random());
 
-  // Initialize native USB and HID peripherals
+  // Increase Serial RX buffer to 512 bytes for high-frequency packet streaming
+  Serial.setRxBufferSize(512);
   Serial.begin(115200);
+
   Keyboard.begin();
   Mouse.begin();
   USB.begin();
 
-  lastCommandTime = millis();
-}
+  for (int i = 0; i < MAX_TAPS; i++) {
+    tapQueue[i].active = false;
+    tapQueue[i].type = TAP_NONE;
+    tapQueue[i].target = 0;
+    tapQueue[i].releaseAt = 0;
+  }
 
-// Helper to press and release a keyboard key with humanized randomized hold
-void tapKey(char key) {
-  Keyboard.press(key);
-  delay(random(48, 112));
-  Keyboard.release(key);
+  lastCommandTime = millis();
 }
 
 void processCommand(const char* cmd) {
@@ -80,90 +224,94 @@ void processCommand(const char* cmd) {
 
   // Dialogue / Interaction / Loot key: F
   if (strcmp(cmd, "F") == 0) {
-    tapKey('f');
+    scheduleKeyTap('f', random(48, 112));
     return;
   }
 
   // Quest Navigation trace key: V
   if (strcmp(cmd, "V") == 0) {
-    tapKey('v');
+    scheduleKeyTap('v', random(48, 112));
     return;
   }
 
   // Elemental Skill: E
   if (strcmp(cmd, "E") == 0) {
-    tapKey('e');
+    scheduleKeyTap('e', random(48, 112));
     return;
   }
 
   // Elemental Burst: Q
   if (strcmp(cmd, "Q") == 0) {
-    tapKey('q');
+    scheduleKeyTap('q', random(48, 112));
     return;
   }
 
   // Bow Aiming Mode Toggle: R
   if (strcmp(cmd, "R") == 0) {
-    Keyboard.press('r');
-    delay(random(45, 85));
-    Keyboard.release('r');
+    scheduleKeyTap('r', random(45, 85));
     return;
   }
 
   // Character Slot Selection: 1, 2, 3, 4
   if (cmd[0] >= '1' && cmd[0] <= '4' && cmd[1] == '\0') {
-    tapKey(cmd[0]);
+    scheduleKeyTap(cmd[0], random(48, 112));
     return;
   }
 
   // Jump / Glide / Unfreeze: SPACE
   if (strcmp(cmd, "SPACE") == 0) {
-    tapKey(' ');
+    scheduleKeyTap(' ', random(48, 112));
     return;
   }
 
   // Left Mouse Button Click: LMB (Normal attack)
   if (strcmp(cmd, "LMB") == 0) {
-    Mouse.press(MOUSE_LEFT);
-    delay(random(48, 112));
-    Mouse.release(MOUSE_LEFT);
+    scheduleMouseTap(MOUSE_LEFT, random(48, 112));
     return;
   }
 
   // Left Mouse Button Press and Hold: LMB_HOLD (Charged attack start)
   if (strcmp(cmd, "LMB_HOLD") == 0) {
     Mouse.press(MOUSE_LEFT);
-    isKeyHeld = true;
+    isLmbHeld = true;
     return;
   }
 
   // Left Mouse Button Release: LMB_REL (Charged attack release)
   if (strcmp(cmd, "LMB_REL") == 0) {
     Mouse.release(MOUSE_LEFT);
+    isLmbHeld = false;
     return;
   }
 
   // Right Mouse Button Click: RMB (Dash / Sprint / Dodge)
   if (strcmp(cmd, "RMB") == 0) {
-    Mouse.press(MOUSE_RIGHT);
-    delay(random(48, 112));
-    Mouse.release(MOUSE_RIGHT);
+    scheduleMouseTap(MOUSE_RIGHT, random(48, 112));
     return;
   }
 
   // Continuous Walk forward: W1
   if (strcmp(cmd, "W1") == 0) {
     Keyboard.press('w');
-    isKeyHeld = true;
+    isWalking = true;
     return;
   }
 
-  // Stop Walk / Emergency Stop: W0, STOP
-  if (strcmp(cmd, "W0") == 0 || strcmp(cmd, "STOP") == 0) {
+  // Pause Walk: W0 (Decoupled: releases 'w' ONLY)
+  if (strcmp(cmd, "W0") == 0) {
+    Keyboard.release('w');
+    isWalking = false;
+    return;
+  }
+
+  // Emergency Stop: STOP (Releases all inputs and clears schedule)
+  if (strcmp(cmd, "STOP") == 0) {
+    clearScheduledReleases();
     Keyboard.releaseAll();
     Mouse.release(MOUSE_LEFT);
     Mouse.release(MOUSE_RIGHT);
-    isKeyHeld = false;
+    isWalking = false;
+    isLmbHeld = false;
     return;
   }
 
@@ -179,9 +327,7 @@ void processCommand(const char* cmd) {
       dx = atoi(cmd + 1);
       dy = 0;
     }
-    dx = constrain(dx, -50, 50);
-    dy = constrain(dy, -50, 50);
-    Mouse.move((int8_t)dx, (int8_t)dy);
+    moveMouseSmooth(dx, dy);
     return;
   }
 }
@@ -207,11 +353,16 @@ void loop() {
     }
   }
 
+  // Non-blocking key/mouse release processor
+  pollScheduledReleases();
+
   // Safety watchdog failsafe: prevent infinite walking or mouse holding if host script crashes
-  if (isKeyHeld && (millis() - lastCommandTime > WATCHDOG_TIMEOUT_MS)) {
+  if ((isWalking || isLmbHeld) && (millis() - lastCommandTime > WATCHDOG_TIMEOUT_MS)) {
+    clearScheduledReleases();
     Keyboard.releaseAll();
     Mouse.release(MOUSE_LEFT);
     Mouse.release(MOUSE_RIGHT);
-    isKeyHeld = false;
+    isWalking = false;
+    isLmbHeld = false;
   }
 }

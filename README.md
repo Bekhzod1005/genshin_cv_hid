@@ -1,8 +1,8 @@
-# Genshin Impact Hardware-Assisted CV Automation (v3)
+# Genshin Impact Hardware-Assisted CV Automation (v4)
 
 A production-grade, self-contained computer-vision navigation, dialogue, chest-looting, and **starter-roster auto-combat** assistant for **Genshin Impact** running on Windows (1280x720 Borderless or Windowed mode). 
 
-Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard and mouse inputs are generated physically through an **ESP32-S3** microcontroller emulating a native USB HID composite device (TinyUSB Keyboard + Mouse).
+Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard and mouse inputs are generated physically through an **ESP32-S3** microcontroller emulating a native USB HID composite device (TinyUSB Keyboard + Mouse) with a non-blocking hardware scheduler and micro-stepped camera rotation.
 
 ```
  ┌─────────────────────────────────────────────────────────────┐
@@ -20,13 +20,15 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
  └────────────┼────────────────────────────────────────────────┘
               │                                  ▲
               │ Virtual Serial (COMx)            │ Physical USB HID
-              │ "1"-"4", "E", "Q", "R", "LMB",   │ Keystrokes & Cursor
-              │ "RMB", "SPACE", "W1", "STOP", ...│
+              │ "1"-"4", "E", "Q", "R", "LMB",   │ Micro-Stepped Mouse &
+              │ "RMB", "SPACE", "W1", "STOP", ...│ Non-Blocking Keystrokes
               ▼                                  │
  ┌───────────────────────────────────────────────┴─────────────┐
  │            ESP32-S3 MICROCONTROLLER (Native USB OTG)        │
  │                                                             │
- │   [CDC Serial Port] ───► [Command Parser] ───► [TinyUSB HID]│
+ │   [512B RX Buffer] ──► [Zero-Delay Parser] ──► [TinyUSB HID]│
+ │          ▲                                           │      │
+ │          └────────── [Non-Blocking millis Queue] ────┘      │
  └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -34,7 +36,11 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
 
 ## Key Features & Safety Architecture
 
-1. **Hardware-Assisted Physical Input:** All keystrokes and mouse movements originate from the ESP32-S3 hardware via native USB HID descriptors with randomized hold durations (48–112 ms). No software synthetic input injection (`SendInput`, `mouse_event`) touches Windows.
+1. **Non-Blocking Hardware-Assisted Physical Input (v4):**
+   - **Zero-Delay Keystroke Scheduler:** Completely removes blocking `delay()` calls from the command parser. A non-blocking `millis()` release table (`MAX_TAPS = 6`) handles humanized hold durations (48–112 ms) asynchronously in `loop()`, allowing incoming `M<dx>,<dy>` camera packets to execute instantaneously without queuing delay.
+   - **Expanded RX Buffer:** Allocates `Serial.setRxBufferSize(512)` on the ESP32-S3 for smooth, high-frequency command streaming.
+   - **Decoupled Hold States:** Forward walk (`W1`/`W0`) and mouse charge (`LMB_HOLD`/`LMB_REL`) operate independently. Sending `W0` releases only `'w'`—never invoking `Keyboard.releaseAll()` or aborting held bow charges.
+   - **Micro-Stepped Mouse Moves (`moveMouseSmooth`):** Sub-steps mouse movements into chunks of maximum `16` counts spaced `1200` microseconds apart, preventing Genshin's 3D camera engine from triggering pointer-acceleration snaps.
 2. **Active-Window Focus Lock:** Continuously checks `win32gui.GetForegroundWindow() == hwnd`. If Genshin Impact loses focus, the assistant immediately sends `STOP` and suspends automation to prevent typing or clicking in other applications.
 3. **Global `F12` Instant Pause Toggle:** Monitored system-wide via `pynput`. Pressing `F12` at any time immediately disengages inputs, releases all keys/buttons, and clears combat and navigation queues.
 4. **Strict State Hierarchy & Arbitration (`DIALOGUE > COMBAT_AUTO > CHEST_LOOT > NAVIGATE`):**
@@ -51,19 +57,18 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
      - **High-Confidence Sealed Ring Detection:** Detects only high-saturation glowing crimson (`H: 0..8` / `172..180`, `S: 175..255`, `V: 170..255`) or anemo-teal (`H: 82..98`, `S: 160..255`, `V: 170..255`) circular lock rings in a tighter mid-screen ROI (`x: 300..980, y: 220..560`) with aspect ratio filtering (`0.70..1.35`, area `350..3200 px`). Broad terrain/brown color guessing has been removed to eliminate false positives on Mondstadt dirt paths and rocks.
      - **Multi-Second Loot Vacuum:** Upon opening a chest or triggering an overworld `[F]` prompt, halts movement (`W0`), waits 0.65s for the chest lid opening animation and scattered drops to hit the ground, and enters a 2.2s–2.8s vacuum burst tapping `F` every 0.16s–0.24s (10–14 taps total) while executing a gentle left/right camera wiggle (`M-18,0` $\rightarrow$ `M36,0` $\rightarrow$ `M-18,0`). Continues draining stacked item drop lists until the `[F]` prompt box is cleared.
    - **State 4 — Overworld Navigation (`NAVIGATE`):**
-     - **User-Supplied Pixel Templates & 30-Frame Multi-Scale Tracking:** Automatically loads `assets/quest_gold.png` and `assets/quest_blue.png` directly from disk (never overwriting custom user templates on startup). Every 30th frame (`frame_idx % 30 == 0`), runs a full multi-scale search (`scales = [0.85, 1.0, 1.15]`, threshold `>= 0.58`) across `ROI_NAV`, verified by dominant interior hue (`Gold H: 15..42`, `Blue H: 92..126`). On the intermediate 29 frames, tracks within a fast $110 \times 110$ px window around the last detected position ($< 0.1$ ms per frame) with fallback to concentric HSV diamond detection.
-     - **Hybrid Gold & Blue Quest Marker Tracking:** Detects both Gold (Archon / Story quests) and Blue World Quest markers. World Quest markers are validated via their authentic concentric signature: **Dark Charcoal/Navy Border (`V < 145`) $\rightarrow$ Slate-Blue/Periwinkle Outer Ring (`H: 96..122, S: 65..220, V: 120..255`) $\rightarrow$ Glowing Light-Cyan Core (`H: 85..112, S: 40..170, V: 215..255`)**, combined with multi-scale template matching (`assets/quest_gold.png` & concentric `assets/quest_blue.png`) and sky/water rejection ($> 50\%$ blue pixels in surrounding $48 \times 48$ box).
+     - **Pure Template-Based Multi-Scale Quest Tracking:** Tracks quest objectives exclusively via `assets/quest_gold.png` and `assets/quest_blue.png` templates, eliminating legacy HSV color guessing. Every 30th frame (`frame_idx % 30 == 0`), runs a full multi-scale search (`scales = [0.85, 1.0, 1.15]`, threshold `>= 0.56`) across `ROI_NAV`, verified by dominant interior hue (`Gold H: 15..42`, `Blue H: 92..126`). On the intermediate 29 frames, tracks within a fast $110 \times 110$ px window around the last detected position ($< 0.1$ ms per frame).
      - **Stamina & Character Exclusion Zone:** Automatically masks out `x: 520..760, y: 240..540` from quest detection so the curved yellow stamina arc next to Lumine never biases the marker centroid.
      - **Hard Center Lock:** When the marker is centered ($|error\_x| \le 28$ px), camera steering is strictly zeroed (`dx = 0`) and minimap road bias is suppressed to eliminate post-lock camera drift. Road-following bias is only applied when the marker is distant/off-center ($|error\_x| > 45$ px).
      - **Lost-Marker Recovery (Pulse 'V' First):** If neither a gold nor blue marker is detected for $> 0.75$s, dispatches `V` (4.5s cooldown) to re-illuminate the navigation trail. Waits 0.9s (total $> 1.65$s); only if the marker remains undetected does it halt walking (`W0`) and begin slow horizontal camera sweeps (`M<dx>`).
      - **Minimap Road-Following:** Segments dirt roads and paths within the circular minimap, calculating path centerline bearing. Biases movement towards roads when within $\pm 55^\circ$ of quest target.
-     - **Smoothed Camera Steering:** Camera mouse steering uses Exponential Moving Average (EMA, $\alpha=0.35$) with rate limiting (max 15–20 Hz) to eliminate micro-stutter.
+     - **Smoothed Camera Steering:** Camera mouse steering uses Exponential Moving Average (EMA, $\alpha=0.35$) with rate limiting (max 15–20 Hz) to eliminate micro-stutter. Proportional steering gain `Kp` (`0.14`) is read directly from `config.json`.
      - **Hard Turn Pausing:** Stops walking (`W0`) during sharp turns ($|error\_x| > 160$ px) to prevent wide drifting.
      - **Obstacle Jumping & Unstuck Logic:** Frame differencing on the player feet region detects terrain obstacles. Automatically triggers `SPACE` jump after 1.8s of stall, followed by lateral evasion if stuck persists.
      - **Overworld [F] Prompt Interaction:** Interacts with Waypoints, Statues, items, and NPCs.
-5. **Firmware Hardware TRNG & Extended Watchdog:** ESP32-S3 uses true hardware random numbers (`esp_random()`) and a 15-second watchdog timer, complemented by 4-second Python navigation keepalive pings.
-6. **Live HSV & Gain Tuner with Instant Hardcoded Reset:** Real-time OpenCV sliders for `H_min`, `H_max`, `S_min`, `S_max`, `V_min`, `V_max`, and proportional steering gain `Kp_x100`, saved to `config.json` with the `S` key. Includes an instant **`Reset [0=No, 1=Reset]`** trackbar and **`D`** hotkey to restore icon-calibrated defaults immediately.
-7. **Capture & Processing FPS Optimization:** Computes optical flow / unstuck differencing and sealed-chest ring masks on a downscaled `0.5x` frame (`640x360`), runs unstuck motion checks only every 3rd frame (`frame_idx % 3 == 0`), and throttles `cv2.imshow` GUI rendering to max 20 FPS while keeping the direct screen capture and HID control loop executing at full hardware speed.
+5. **Firmware TRNG & 12-Second Watchdog:** ESP32-S3 uses true hardware random numbers (`esp_random()`) and a 12-second safety watchdog timer, complemented by 4-second Python navigation keepalive pings.
+6. **Safe OpenCV Window Lifecycle:** All GUI rendering and window calls are guarded with `cv2.getWindowProperty` and `try...except cv2.error` handlers. Closing the debug window with the Windows `X` button terminates cleanly without `NULL window` crashes.
+7. **High-Performance Capture Pipeline:** Computes optical flow / unstuck differencing and sealed-chest ring masks on a downscaled `0.5x` frame (`640x360`), runs unstuck motion checks only every 3rd frame (`frame_idx % 3 == 0`), and throttles `cv2.imshow` GUI rendering to max 20 FPS while the screen capture and non-blocking HID loop execute at full speed.
 
 ---
 
@@ -73,13 +78,15 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
 genshin_cv_hid/
 ├── assets/
 │   ├── .gitkeep              # Optional templates (minimap_border.png, choice_icon.png)
-├── config.json               # Persisted HSV thresholds, EMA alpha, and steering gain
+│   ├── quest_gold.png        # 28x28 Gold Archon/Story quest diamond template
+│   └── quest_blue.png        # 28x28 Blue World Quest diamond template
+├── config.json               # Persisted Kp gain, EMA alpha, and lost-marker timings
 ├── firmware/
 │   └── esp32s3_hid/
-│       └── esp32s3_hid.ino   # Arduino TinyUSB HID + CDC Serial sketch (v3)
+│       └── esp32s3_hid.ino   # Non-blocking TinyUSB HID + CDC Serial sketch (v4)
 ├── app/
 │   ├── __init__.py
-│   ├── main.py               # Main CV capture, auto-combat & live tuner
+│   ├── main.py               # Main CV capture, auto-combat & template tracker
 │   └── test_hid.py           # Standalone serial-to-HID verification utility
 ├── requirements.txt
 └── README.md
@@ -121,24 +128,25 @@ genshin_cv_hid/
 
 ## Serial Command Protocol
 
-| Command | Action | Hold Duration |
-|---|---|---|
-| `PING` | Handshake verification (returns `PONG\n`) | Instant |
-| `1`, `2`, `3`, `4` | Select party member slot 1 to 4 | 48–112 ms (Randomized) |
-| `E` | Cast Elemental Skill | 48–112 ms (Randomized) |
-| `Q` | Cast Elemental Burst | 48–112 ms (Randomized) |
-| `R` | Toggle Bow Aiming Mode | 45–85 ms (Randomized) |
-| `LMB` | Normal Attack (Left Mouse Click) | 48–112 ms (Randomized) |
-| `LMB_HOLD` | Begin Charged Attack (Hold Left Mouse Button) | Continuous until `LMB_REL` |
-| `LMB_REL` | Finish Charged Attack (Release Left Mouse Button) | Instant |
-| `RMB` | Sprint Dash / Dodge (Right Mouse Click) | 48–112 ms (Randomized) |
-| `SPACE` | Jump / Glide / Unfreeze | 48–112 ms (Randomized) |
-| `F` | Interact / Dialogue Option / Chest Loot | 48–112 ms (Randomized) |
-| `V` | Quest Navigation Trail | 48–112 ms (Randomized) |
-| `W1` | Continuous forward walk | Continuous until `W0`/`STOP` |
-| `W0` / `STOP` | Emergency stop: releases all keys and mouse buttons | Instant |
-| `M<dx>` | Relative horizontal mouse move (`[-50, 50]`) | Instant |
-| `M<dx>,<dy>` | 2-axis relative mouse move (`dx, dy in [-50, 50]`) | Instant |
+| Command | Action | Execution | Hold Duration |
+|---|---|---|---|
+| `PING` | Handshake verification (returns `PONG\n`) | Immediate | Instant |
+| `1`, `2`, `3`, `4` | Select party member slot 1 to 4 | Non-Blocking | 48–112 ms (Randomized) |
+| `E` | Cast Elemental Skill | Non-Blocking | 48–112 ms (Randomized) |
+| `Q` | Cast Elemental Burst | Non-Blocking | 48–112 ms (Randomized) |
+| `R` | Toggle Bow Aiming Mode | Non-Blocking | 45–85 ms (Randomized) |
+| `LMB` | Normal Attack (Left Mouse Click) | Non-Blocking | 48–112 ms (Randomized) |
+| `LMB_HOLD` | Begin Charged Attack (Hold Left Mouse Button) | Immediate | Continuous until `LMB_REL` |
+| `LMB_REL` | Finish Charged Attack (Release Left Mouse Button) | Immediate | Instant (clears `isLmbHeld`) |
+| `RMB` | Sprint Dash / Dodge (Right Mouse Click) | Non-Blocking | 48–112 ms (Randomized) |
+| `SPACE` | Jump / Glide / Unfreeze | Non-Blocking | 48–112 ms (Randomized) |
+| `F` | Interact / Dialogue Option / Chest Loot | Non-Blocking | 48–112 ms (Randomized) |
+| `V` | Quest Navigation Trail | Non-Blocking | 48–112 ms (Randomized) |
+| `W1` | Continuous forward walk | Immediate | Continuous until `W0` or `STOP` |
+| `W0` | Pause forward walk (releases `'w'` only) | Immediate | Instant (decoupled from mouse) |
+| `STOP` | Emergency stop: releases all keys, mouse buttons & queue | Immediate | Instant |
+| `M<dx>` | Smooth horizontal mouse move (max 16 counts/chunk) | Micro-Stepped | Instant (1200us step spacing) |
+| `M<dx>,<dy>` | Smooth 2-axis mouse move (max 16 counts/chunk) | Micro-Stepped | Instant (1200us step spacing) |
 
 ---
 
@@ -211,7 +219,7 @@ python app/main.py --port COM4
 ```
 
 ### Dry-Run Mode (Testing without Hardware)
-Runs screen capture, the live HSV tuner, and state machine preview with no serial connection required:
+Runs screen capture, template tracker, and state machine preview with no serial connection required:
 ```powershell
 python app/main.py --dry-run
 ```
@@ -225,9 +233,8 @@ python app/main.py --dry-run
 | **`F12`** | Global (Any Window) | **Instant Pause / Resume Toggle**. Immediately releases all held keys (`STOP`), clears queues, and suspends automation. |
 | **`T`** | Debug Window | **Capture Active Diamond Template**. Crops a 28x28 patch around the tracked marker and saves to `assets/quest_gold.png` or `assets/quest_blue.png`. |
 | **Mouse Click** | Debug Window | **Crop Template At Cursor**. Left-click on any quest diamond on the live debug window to instantly save a 28x28 reference template. |
-| **`D`** | Debug Window | **Reset Tuner to Calibrated Defaults**. Restores hardcoded in-game calibrated HSV thresholds and `Kp` gain, and updates `config.json`. |
-| **Reset Trackbar** | Tuner Window | **One-Click Tuner Reset**. Move the `Reset [0=No, 1=Reset]` trackbar to `1` to restore hardcoded defaults. |
-| **`S`** | Debug Window | **Save Configuration**. Saves current Tuner HSV thresholds, EMA alpha, and `Kp_x100` gain to `config.json`. |
+| **`D`** | Debug Window | **Reset Configuration to Defaults**. Restores hardcoded defaults (`Kp = 0.14`, `threshold = 0.56`, etc.) and updates `config.json`. |
+| **`S`** | Debug Window | **Save Configuration**. Saves current configuration to `config.json`. |
 | **`Q`** / **`ESC`** | Debug Window | **Clean Shutdown**. Issues emergency `STOP` command to ESP32-S3, closes serial, and destroys OpenCV windows. |
 
 ---
@@ -238,5 +245,5 @@ python app/main.py --dry-run
   Ensure you are plugged into the **native USB** port on the board. In Windows Device Manager, check under *Ports (COM & LPT)*. If marked with a yellow triangle, reinstall the ESP32 USB CDC driver or press the `BOOT` + `RESET` buttons on the board to enter download mode.
 - **Combat Timing Out at 45s:**
   If an enemy is shielded or obstructed, the 45s safety cutoff triggers and beeps, allowing manual takeover. Once cleared, the assistant automatically resumes `NAVIGATE`.
-- **Road or Quest Tuning:**
-  Use the live Tuner window sliders to adjust HSV filter bounds and steering gain in real-time, then press **`S`** to persist to `config.json`.
+- **Recapturing Quest Templates:**
+  If quest icons look different under custom shaders or display settings, press **`T`** while the marker is on screen, or left-click directly on the diamond in the live debug window to save a fresh 28x28 template.

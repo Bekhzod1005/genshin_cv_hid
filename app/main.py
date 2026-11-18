@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Genshin Impact Hardware-Assisted Computer Vision Automation (v3.4 Production)
+Genshin Impact Hardware-Assisted Computer Vision Automation (v4 Production)
 ===========================================================================
 Architecture:
 - Screen Capture: mss (direct desktop / client-rect capture normalized to 1280x720)
 - Hardware Input: ESP32-S3 Microcontroller running TinyUSB HID Keyboard & 2-Axis Mouse
+  with non-blocking millis() scheduler, 512-byte RX buffer, micro-stepped mouse steering,
+  and decoupled hold states.
 - Strict State Hierarchy:
     1. DIALOGUE      : Minimap hidden -> Strict top priority, halts all combat/movement/loot,
                        runs natural log-normal dialogue & choice progression.
@@ -16,9 +18,9 @@ Architecture:
     3. CHEST_LOOT    : High-confidence sealed chest ring or overworld [F] loot trigger ->
                        halts movement (W0), opens chest, waits 0.65s lid animation, enters 2.2-2.8s
                        multi-tap [F] vacuum burst with left/right camera wiggle, and drains stacked loot drops.
-    4. NAVIGATE      : 30-Frame Multi-Scale Template Scan + Fast 110x110 Local ROI Tracking:
+    4. NAVIGATE      : Pure Template-Based Multi-Scale Quest Tracking:
                        - Auto-loads user PNG templates (assets/quest_gold.png & assets/quest_blue.png)
-                       - Full-screen scan every 30th frame (scales: [0.85, 1.0, 1.15], threshold >= 0.58)
+                       - Full-screen scan every 30th frame (scales: [0.85, 1.0, 1.15], threshold >= 0.56)
                        - Fast 110x110 px local tracking on intermediate frames (60+ FPS steering)
                        - Interior dominant hue verification (Gold H: 15..42, Blue H: 92..126)
                        - Stamina/Player exclusion zone masking (x: 520..760, y: 240..540)
@@ -27,11 +29,12 @@ Architecture:
 - Safety & Hotkeys:
     - [F12] : Global Pause / Resume Toggle
     - [T]   : Capture 28x28 Diamond Reference Template (or Left-Click on Debug Window)
-    - [D]   : Reset Tuner to Hardcoded Calibrated Defaults (or use Tuner 'Reset' trackbar)
-    - [S]   : Save current Tuner settings to config.json
+    - [D]   : Reset Configuration to Hardcoded Defaults
+    - [S]   : Save active settings to config.json
     - [Q]   : Clean Shutdown & Emergency Key Release
+    - Safe OpenCV window lifecycle (guards against 'X' close crashes)
     - Active Window Focus Lock (win32gui.GetForegroundWindow() == hwnd)
-    - 15-Second Safety Watchdog in Microcontroller Firmware + 4.0s keepalive
+    - 12-Second Safety Watchdog in Microcontroller Firmware + 4.0s keepalive
 """
 
 import os
@@ -119,27 +122,12 @@ STATE_NAVIGATE = "NAVIGATE"
 # Hardcoded Calibrated Defaults
 # ==============================================================================
 HARDCODED_DEFAULTS = {
-    # Gold Quest Diamond (Archon/Story)
-    "H_min": 18,
-    "H_max": 38,
-    "S_min": 140,
-    "S_max": 255,
-    "V_min": 180,
-    "V_max": 255,
-    # Blue World Quest Diamond
-    "Blue_H_min": 96,
-    "Blue_H_max": 122,
-    "Blue_S_min": 65,
-    "Blue_S_max": 220,
-    "Blue_V_min": 120,
-    "Blue_V_max": 255,
-    # Steering & Camera
-    "Kp_x100": 14,
+    "Kp": 0.14,
     "steer_ema_alpha": 0.35,
     "road_following_enabled": True,
     "center_lock_deadzone": 28,
     "blue_marker_enabled": True,
-    # Lost-Marker Pulse & Sweep Recovery
+    "template_match_threshold": 0.56,
     "quest_v_pulse_cooldown": 4.5,
     "lost_marker_v_delay": 0.75,
     "lost_marker_sweep_delay": 1.65,
@@ -328,14 +316,14 @@ class ESP32HIDController:
             self.walk_start_time = time.time()
 
     def stop_walk(self):
-        """Release forward walk ('W0')."""
+        """Release forward walk ('W0') decoupled from LMB or other keys."""
         if self.is_walking:
             self.send_command("W0")
             self.is_walking = False
             self.walk_start_time = 0.0
 
     def stop_all(self):
-        """Emergency stop: release all keyboard keys and mouse buttons ('STOP')."""
+        """Emergency stop: release all keyboard keys, mouse buttons, and schedules ('STOP')."""
         self.send_command("STOP")
         self.is_walking = False
         self.is_lmb_held = False
@@ -388,40 +376,6 @@ def save_config(config: Dict[str, Any]):
     except Exception as e:
         print(f"[CONFIG ERROR] Failed saving {CONFIG_PATH}: {e}")
         return False
-
-
-# ==============================================================================
-# OpenCV Tuner Window & Trackbars
-# ==============================================================================
-TUNER_WINDOW = "Genshin Tuner (HSV & Gain)"
-
-
-def nothing(x):
-    pass
-
-
-def setup_tuner_window(initial_cfg: Dict[str, Any]):
-    cv2.namedWindow(TUNER_WINDOW, cv2.WINDOW_AUTOSIZE)
-    cv2.createTrackbar("H_min", TUNER_WINDOW, initial_cfg.get("H_min", 18), 179, nothing)
-    cv2.createTrackbar("H_max", TUNER_WINDOW, initial_cfg.get("H_max", 38), 179, nothing)
-    cv2.createTrackbar("S_min", TUNER_WINDOW, initial_cfg.get("S_min", 140), 255, nothing)
-    cv2.createTrackbar("S_max", TUNER_WINDOW, initial_cfg.get("S_max", 255), 255, nothing)
-    cv2.createTrackbar("V_min", TUNER_WINDOW, initial_cfg.get("V_min", 180), 255, nothing)
-    cv2.createTrackbar("V_max", TUNER_WINDOW, initial_cfg.get("V_max", 255), 255, nothing)
-    cv2.createTrackbar("Kp_x100", TUNER_WINDOW, min(initial_cfg.get("Kp_x100", 14), 40), 40, nothing)
-    cv2.createTrackbar("Reset [0=No, 1=Reset]", TUNER_WINDOW, 0, 1, nothing)
-
-
-def read_tuner_values() -> Dict[str, Any]:
-    return {
-        "H_min": cv2.getTrackbarPos("H_min", TUNER_WINDOW),
-        "H_max": cv2.getTrackbarPos("H_max", TUNER_WINDOW),
-        "S_min": cv2.getTrackbarPos("S_min", TUNER_WINDOW),
-        "S_max": cv2.getTrackbarPos("S_max", TUNER_WINDOW),
-        "V_min": cv2.getTrackbarPos("V_min", TUNER_WINDOW),
-        "V_max": cv2.getTrackbarPos("V_max", TUNER_WINDOW),
-        "Kp_x100": cv2.getTrackbarPos("Kp_x100", TUNER_WINDOW),
-    }
 
 
 # ==============================================================================
@@ -788,60 +742,61 @@ class VisionDetector:
         core = patch_bgr[ph // 4 : 3 * ph // 4, pw // 4 : 3 * pw // 4]
         hsv_core = cv2.cvtColor(core, cv2.COLOR_BGR2HSV)
         if expected_type == "GOLD":
-            # Gold: H: 15..42
             mask = cv2.inRange(hsv_core, np.array([15, 90, 130]), np.array([42, 255, 255]))
             return cv2.countNonZero(mask) >= 6
         elif expected_type == "BLUE":
-            # Blue: H: 92..126
             mask = cv2.inRange(hsv_core, np.array([92, 45, 110]), np.array([126, 255, 255]))
             return cv2.countNonZero(mask) >= 6
         return False
 
+    def _is_sky_or_water_background(self, frame_bgr: np.ndarray, cx: int, cy: int) -> bool:
+        """Sky & Water Rejection: Inspect surrounding 48x48 box. Reject if > 50% blue."""
+        sy1 = max(0, cy - 24)
+        sy2 = min(TARGET_HEIGHT, cy + 24)
+        sx1 = max(0, cx - 24)
+        sx2 = min(TARGET_WIDTH, cx + 24)
+        surround = frame_bgr[sy1:sy2, sx1:sx2]
+        if surround.size == 0:
+            return True
+
+        hsv_surround = cv2.cvtColor(surround, cv2.COLOR_BGR2HSV)
+        sky_blue_mask = cv2.inRange(hsv_surround, np.array([85, 55, 110]), np.array([125, 255, 255]))
+        blue_pixel_count = cv2.countNonZero(sky_blue_mask)
+        total_pixels = surround.shape[0] * surround.shape[1]
+        blue_ratio = float(blue_pixel_count) / float(total_pixels)
+        return blue_ratio > 0.50
+
     def track_quest_marker(
         self,
         frame_bgr: np.ndarray,
-        tuner_cfg: Dict[str, Any],
+        config: Dict[str, Any],
         frame_idx: int,
         last_lock: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[Optional[Tuple[int, int]], Optional[str], np.ndarray, Optional[Tuple[int, int, int, int]], float, str]:
+    ) -> Tuple[Optional[Tuple[int, int]], Optional[str], Optional[Tuple[int, int, int, int]], float, str]:
         """
-        Hybrid 30-Frame Multi-Scale Template Scan + Fast 110x110 Local Tracking:
+        Pure Template-Based Multi-Scale Quest Tracking:
         - Every 30th frame (or when no lock): full-screen multi-scale template scan across ROI_NAV.
+          Scales: [0.85, 1.0, 1.15], match threshold >= 0.56.
         - On 29 intermediate frames: fast 110x110 local search around last locked position (60+ FPS).
         - Interior dominant hue verification (Gold H: 15..42, Blue H: 92..126).
-        - Stamina/Player exclusion zone masking (x: 520..760, y: 240..540).
-        - Concentric HSV contour matching fallback.
-        
-        Returns: (centroid, marker_type, display_mask, bbox, score, scan_mode_label)
+        - Surrounding background sky/water rejection.
+        - Central Stamina/Player exclusion zone masking (x: 520..760, y: 240..540).
+
+        Returns: (centroid, marker_type, bbox, score, scan_mode_label)
         """
         y1, y2, x1, x2 = ROI_NAV
         roi = frame_bgr[y1:y2, x1:x2]
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         gray_full = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+        match_thresh = float(config.get("template_match_threshold", 0.56))
+        blue_enabled = bool(config.get("blue_marker_enabled", True))
 
         # Exclusion zone bounds relative to ROI_NAV
         ey1 = max(0, 240 - y1)
         ey2 = min(roi.shape[0], 540 - y1)
         ex1 = max(0, 520 - x1)
         ex2 = min(roi.shape[1], 760 - x1)
-
-        # HSV Masks for fallback & tuner preview
-        lower_gold = np.array([tuner_cfg.get("H_min", 18), tuner_cfg.get("S_min", 140), tuner_cfg.get("V_min", 180)], dtype=np.uint8)
-        upper_gold = np.array([tuner_cfg.get("H_max", 38), tuner_cfg.get("S_max", 255), tuner_cfg.get("V_max", 255)], dtype=np.uint8)
-        gold_mask = cv2.inRange(hsv_roi, lower_gold, upper_gold)
-
-        lower_blue = np.array([tuner_cfg.get("Blue_H_min", 96), tuner_cfg.get("Blue_S_min", 65), tuner_cfg.get("Blue_V_min", 120)], dtype=np.uint8)
-        upper_blue = np.array([tuner_cfg.get("Blue_H_max", 122), tuner_cfg.get("Blue_S_max", 220), tuner_cfg.get("Blue_V_max", 255)], dtype=np.uint8)
-        blue_mask = cv2.inRange(hsv_roi, lower_blue, upper_blue)
-
-        gold_mask[ey1:ey2, ex1:ex2] = 0
-        blue_mask[ey1:ey2, ex1:ex2] = 0
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        gold_mask = cv2.morphologyEx(gold_mask, cv2.MORPH_OPEN, kernel)
-        blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, kernel)
-        display_mask = cv2.bitwise_or(gold_mask, blue_mask)
 
         is_30f_scan = (frame_idx % 30 == 0) or (last_lock is None)
 
@@ -855,7 +810,6 @@ class VisionDetector:
 
             if tmpl_gray is not None:
                 tw, th = tmpl_gray.shape[1], tmpl_gray.shape[0]
-                # 110x110 local window
                 half_win = 55
                 ly1 = max(100, last_cy - half_win)
                 ly2 = min(540, last_cy + half_win)
@@ -867,14 +821,16 @@ class VisionDetector:
                     res = cv2.matchTemplate(local_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, max_loc = cv2.minMaxLoc(res)
 
-                    if max_val >= 0.55:
+                    if max_val >= match_thresh:
                         tx, ty = max_loc
                         tcx = lx1 + tx + tw // 2
                         tcy = ly1 + ty + th // 2
-                        patch = frame_bgr[ly1 + ty : ly1 + ty + th, lx1 + tx : lx1 + tx + tw]
-                        if self._verify_template_hue(patch, last_type):
-                            if last_type == "GOLD" or not self._is_sky_or_water_background(frame_bgr, tcx, tcy):
-                                return (tcx, tcy), last_type, display_mask, (lx1 + tx, ly1 + ty, tw, th), float(max_val), "Track: 110x110"
+                        # Check stamina exclusion zone
+                        if not (520 <= tcx <= 760 and 240 <= tcy <= 540):
+                            patch = frame_bgr[ly1 + ty : ly1 + ty + th, lx1 + tx : lx1 + tx + tw]
+                            if self._verify_template_hue(patch, last_type):
+                                if last_type == "GOLD" or not self._is_sky_or_water_background(frame_bgr, tcx, tcy):
+                                    return (tcx, tcy), last_type, (lx1 + tx, ly1 + ty, tw, th), float(max_val), "Track: 110x110"
 
         # ----------------------------------------------------------------------
         # 30-FRAME FULL SCAN (OR FIRST SCAN): MULTI-SCALE MATCHING (scales: 0.85, 1.0, 1.15)
@@ -893,7 +849,7 @@ class VisionDetector:
                     res = cv2.matchTemplate(gray_roi, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
                     res[ey1:ey2, ex1:ex2] = -1.0
                     _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                    if max_val >= 0.58:
+                    if max_val >= match_thresh:
                         tx, ty = max_loc
                         tcx = x1 + tx + tw // 2
                         tcy = y1 + ty + th // 2
@@ -909,7 +865,7 @@ class VisionDetector:
                             break
 
             # 2. Blue Template Multi-Scale Scan
-            if self.quest_blue_template_gray is not None:
+            if blue_enabled and self.quest_blue_template_gray is not None:
                 for scale in (0.85, 1.0, 1.15):
                     tw = int(self.quest_blue_template_gray.shape[1] * scale)
                     th = int(self.quest_blue_template_gray.shape[0] * scale)
@@ -919,7 +875,7 @@ class VisionDetector:
                     res = cv2.matchTemplate(gray_roi, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
                     res[ey1:ey2, ex1:ex2] = -1.0
                     _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                    if max_val >= 0.58:
+                    if max_val >= match_thresh:
                         tx, ty = max_loc
                         tcx = x1 + tx + tw // 2
                         tcy = y1 + ty + th // 2
@@ -937,120 +893,9 @@ class VisionDetector:
         if template_candidates:
             template_candidates.sort(key=lambda item: (1 if item["type"] == "GOLD" else 0, item["score"]), reverse=True)
             best = template_candidates[0]
-            return best["centroid"], best["type"], display_mask, best["bbox"], best["score"], best["scan_mode"]
+            return best["centroid"], best["type"], best["bbox"], best["score"], best["scan_mode"]
 
-        # ----------------------------------------------------------------------
-        # COMPLEMENTARY CONCENTRIC HSV CONTOUR DETECTION (FALLBACK)
-        # ----------------------------------------------------------------------
-        hsv_candidates: List[Dict[str, Any]] = []
-
-        # Concentric Blue Diamond check
-        b_contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in b_contours:
-            area = cv2.contourArea(c)
-            if 20 <= area <= 950:
-                bx, by, bw, bh = cv2.boundingRect(c)
-                if 10 <= bw <= 38 and 10 <= bh <= 38:
-                    aspect_ratio = float(bw) / float(bh)
-                    if 0.70 <= aspect_ratio <= 1.40:
-                        M = cv2.moments(c)
-                        if M["m00"] > 0:
-                            cx = int(M["m10"] / M["m00"]) + x1
-                            cy = int(M["m01"] / M["m00"]) + y1
-                            patch_bgr = roi[by : by + bh, bx : bx + bw]
-                            is_concentric, concentric_score = self._verify_blue_diamond_concentric(patch_bgr)
-                            if is_concentric and not self._is_sky_or_water_background(frame_bgr, cx, cy):
-                                hsv_candidates.append({
-                                    "type": "BLUE",
-                                    "score": concentric_score,
-                                    "centroid": (cx, cy),
-                                    "bbox": (x1 + bx, y1 + by, bw, bh),
-                                    "scan_mode": "HSV Contour",
-                                })
-
-        # Gold Diamond check
-        g_contours, _ = cv2.findContours(gold_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in g_contours:
-            area = cv2.contourArea(c)
-            if 20 <= area <= 950:
-                bx, by, bw, bh = cv2.boundingRect(c)
-                if 10 <= bw <= 36 and 10 <= bh <= 36:
-                    aspect_ratio = float(bw) / float(bh)
-                    if 0.70 <= aspect_ratio <= 1.40:
-                        M = cv2.moments(c)
-                        if M["m00"] > 0:
-                            cx = int(M["m10"] / M["m00"]) + x1
-                            cy = int(M["m01"] / M["m00"]) + y1
-                            hsv_candidates.append({
-                                "type": "GOLD",
-                                "score": float(area / 100.0),
-                                "centroid": (cx, cy),
-                                "bbox": (x1 + bx, y1 + by, bw, bh),
-                                "scan_mode": "HSV Contour",
-                            })
-
-        if hsv_candidates:
-            hsv_candidates.sort(key=lambda item: (1 if item["type"] == "GOLD" else 0, item["score"]), reverse=True)
-            best = hsv_candidates[0]
-            return best["centroid"], best["type"], display_mask, best["bbox"], best["score"], best["scan_mode"]
-
-        return None, None, display_mask, None, 0.0, "None"
-
-    def _verify_blue_diamond_concentric(self, patch_bgr: np.ndarray) -> Tuple[bool, float]:
-        """Verifies concentric slate-blue outer ring + dark navy border + light-cyan core."""
-        if patch_bgr.shape[0] < 8 or patch_bgr.shape[1] < 8:
-            return False, 0.0
-
-        ph, pw = patch_bgr.shape[:2]
-        patch_hsv = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2HSV)
-
-        # 1. Slate-blue mid-ring
-        blue_ring_mask = cv2.inRange(patch_hsv, np.array([96, 65, 120]), np.array([122, 220, 255]))
-        blue_ring_count = cv2.countNonZero(blue_ring_mask)
-        if blue_ring_count < 6:
-            return False, 0.0
-
-        # 2. Center 35% cyan/white core
-        cw = max(2, int(pw * 0.35))
-        ch = max(2, int(ph * 0.35))
-        cx = pw // 2
-        cy = ph // 2
-        core_hsv = patch_hsv[max(0, cy - ch // 2) : min(ph, cy + ch // 2), max(0, cx - cw // 2) : min(pw, cx + cw // 2)]
-        cyan_core_mask = cv2.inRange(core_hsv, np.array([85, 40, 215]), np.array([112, 170, 255]))
-        cyan_core_count = cv2.countNonZero(cyan_core_mask)
-        has_cyan_core = cyan_core_count >= 1
-
-        # 3. Dark charcoal/navy border ring (V < 145)
-        dark_mask = patch_hsv[:, :, 2] < 145
-        dark_count = np.count_nonzero(dark_mask)
-        has_dark_border = dark_count >= 4
-
-        if has_cyan_core and has_dark_border:
-            score = 0.55 + (blue_ring_count / float(ph * pw)) * 0.45
-            return True, score
-
-        if (has_cyan_core or has_dark_border) and blue_ring_count >= 10:
-            score = 0.40 + (blue_ring_count / float(ph * pw)) * 0.40
-            return True, score
-
-        return False, 0.0
-
-    def _is_sky_or_water_background(self, frame_bgr: np.ndarray, cx: int, cy: int) -> bool:
-        """Sky & Water Rejection: Inspect surrounding 48x48 box. Reject if > 50% blue."""
-        sy1 = max(0, cy - 24)
-        sy2 = min(TARGET_HEIGHT, cy + 24)
-        sx1 = max(0, cx - 24)
-        sx2 = min(TARGET_WIDTH, cx + 24)
-        surround = frame_bgr[sy1:sy2, sx1:sx2]
-        if surround.size == 0:
-            return True
-
-        hsv_surround = cv2.cvtColor(surround, cv2.COLOR_BGR2HSV)
-        sky_blue_mask = cv2.inRange(hsv_surround, np.array([85, 55, 110]), np.array([125, 255, 255]))
-        blue_pixel_count = cv2.countNonZero(sky_blue_mask)
-        total_pixels = surround.shape[0] * surround.shape[1]
-        blue_ratio = float(blue_pixel_count) / float(total_pixels)
-        return blue_ratio > 0.50
+        return None, None, None, 0.0, "None"
 
     def calculate_ground_motion_downscaled(
         self, frame_half: np.ndarray, prev_ground_gray_half: Optional[np.ndarray]
@@ -1205,31 +1050,12 @@ class GenshinAssistant:
         listener.start()
         print("[HOTKEY] Registered global 'F12' instant toggle pause listener.")
 
-    def reset_tuner_to_defaults(self):
-        """Reset all Tuner sliders back to HARDCODED_DEFAULTS, save to config.json, and reset trackbar."""
-        for key, val in [
-            ("H_min", HARDCODED_DEFAULTS["H_min"]),
-            ("H_max", HARDCODED_DEFAULTS["H_max"]),
-            ("S_min", HARDCODED_DEFAULTS["S_min"]),
-            ("S_max", HARDCODED_DEFAULTS["S_max"]),
-            ("V_min", HARDCODED_DEFAULTS["V_min"]),
-            ("V_max", HARDCODED_DEFAULTS["V_max"]),
-            ("Kp_x100", HARDCODED_DEFAULTS["Kp_x100"]),
-        ]:
-            try:
-                cv2.setTrackbarPos(key, TUNER_WINDOW, val)
-            except Exception:
-                pass
-
-        try:
-            cv2.setTrackbarPos("Reset [0=No, 1=Reset]", TUNER_WINDOW, 0)
-        except Exception:
-            pass
-
-        self.config = {**self.config, **HARDCODED_DEFAULTS}
+    def reset_config_to_defaults(self):
+        """Reset configuration back to HARDCODED_DEFAULTS and save to config.json."""
+        self.config = HARDCODED_DEFAULTS.copy()
         save_config(self.config)
         self.reset_banner_until = time.time() + 2.5
-        print("[CONFIG] Tuner reset to hardcoded icon-calibrated defaults.")
+        print("[CONFIG] Configuration reset to hardcoded defaults.")
 
     def _on_debug_mouse_click(self, event, x, y, flags, param):
         """Click on the Debug window to crop a 28x28 template diamond at click location."""
@@ -1252,11 +1078,14 @@ class GenshinAssistant:
                     mtype = "GOLD"
 
                 out_path = os.path.join(ASSETS_DIR, target_name)
-                cv2.imwrite(out_path, patch)
-                self.detector.reload_templates()
-                self.template_banner_text = f"SAVED {mtype} TEMPLATE ({target_name}) FROM CLICK!"
-                self.template_banner_until = time.time() + 2.5
-                print(f"[TEMPLATE] Saved 28x28 {mtype} template from click at ({cx}, {cy}) to {out_path}")
+                try:
+                    cv2.imwrite(out_path, patch)
+                    self.detector.reload_templates()
+                    self.template_banner_text = f"SAVED {mtype} TEMPLATE ({target_name}) FROM CLICK!"
+                    self.template_banner_until = time.time() + 2.5
+                    print(f"[TEMPLATE] Saved 28x28 {mtype} template from click at ({cx}, {cy}) to {out_path}")
+                except Exception as e:
+                    print(f"[TEMPLATE ERROR] Could not save template: {e}")
 
     def capture_active_diamond_template(self):
         """Crop 28x28 patch around currently tracked diamond and save to assets (triggered by 'T')."""
@@ -1272,11 +1101,14 @@ class GenshinAssistant:
                 mtype = self.active_marker_type or "GOLD"
                 target_name = "quest_gold.png" if mtype == "GOLD" else "quest_blue.png"
                 out_path = os.path.join(ASSETS_DIR, target_name)
-                cv2.imwrite(out_path, patch)
-                self.detector.reload_templates()
-                self.template_banner_text = f"SAVED {mtype} TEMPLATE ({target_name})!"
-                self.template_banner_until = time.time() + 2.5
-                print(f"[TEMPLATE] Hotkey 'T' saved {mtype} template at ({cx}, {cy}) to {out_path}")
+                try:
+                    cv2.imwrite(out_path, patch)
+                    self.detector.reload_templates()
+                    self.template_banner_text = f"SAVED {mtype} TEMPLATE ({target_name})!"
+                    self.template_banner_until = time.time() + 2.5
+                    print(f"[TEMPLATE] Hotkey 'T' saved {mtype} template at ({cx}, {cy}) to {out_path}")
+                except Exception as e:
+                    print(f"[TEMPLATE ERROR] Could not save template: {e}")
         else:
             print("[TEMPLATE] No candidate quest diamond tracked right now. Left-click on the Debug window to crop!")
 
@@ -1299,7 +1131,6 @@ class GenshinAssistant:
 
     def run(self):
         setup_dpi_awareness()
-        setup_tuner_window(self.config)
 
         cv2.namedWindow("Genshin Assistant Debug", cv2.WINDOW_AUTOSIZE)
         cv2.setMouseCallback("Genshin Assistant Debug", self._on_debug_mouse_click)
@@ -1309,15 +1140,15 @@ class GenshinAssistant:
         current_fps = 0.0
 
         print("\n" + "=" * 70)
-        print(" Genshin Impact CV Assistant Running (v3.4 Production)")
+        print(" Genshin Impact CV Assistant Running (v4 Production)")
         print(" Hierarchy: DIALOGUE > COMBAT_AUTO > CHEST_LOOT > NAVIGATE")
         print(" Combat   : Strict Horizontal HP Bar Geometry (Anti-Sunset Filter)")
-        print(" Quests   : 30f Multi-Scale Template Scan + 110x110 Fast Local Tracking")
+        print(" Quests   : Pure Template-Based Multi-Scale Tracking (Gold & Blue)")
         print(" Hotkeys:")
         print("   [F12] : Instant Global Pause / Resume Toggle")
         print("   [T]   : Crop & Save 28x28 Diamond Template (or Left-Click Screen)")
-        print("   [D]   : Reset Tuner to Hardcoded Calibrated Defaults")
-        print("   [S]   : Save current Tuner settings to config.json")
+        print("   [D]   : Reset Configuration to Hardcoded Defaults")
+        print("   [S]   : Save active settings to config.json")
         print("   [Q]   : Clean Shutdown & Emergency Key Release")
         print("=" * 70 + "\n")
 
@@ -1395,14 +1226,15 @@ class GenshinAssistant:
                     if now - self.last_render_time >= 0.05:
                         self.last_render_time = now
 
-                        # Check Reset Trackbar on Tuner Window
+                        # Safe Window Lifecycle Check: detect if user clicked the 'X' button
                         try:
-                            if cv2.getTrackbarPos("Reset [0=No, 1=Reset]", TUNER_WINDOW) == 1:
-                                self.reset_tuner_to_defaults()
-                        except Exception:
-                            pass
-
-                        self.config = {**self.config, **read_tuner_values()}
+                            prop = cv2.getWindowProperty("Genshin Assistant Debug", cv2.WND_PROP_VISIBLE)
+                            if prop < 1:
+                                print("\n[INFO] Debug window closed by user ('X' button clicked). Exiting...")
+                                break
+                        except cv2.error:
+                            print("\n[INFO] Debug window destroyed. Exiting...")
+                            break
 
                         debug_frame = frame.copy()
                         if not is_focused:
@@ -1412,26 +1244,18 @@ class GenshinAssistant:
                         else:
                             self._draw_hud(debug_frame, current_fps, is_focused)
 
-                        cv2.imshow("Genshin Assistant Debug", debug_frame)
+                        try:
+                            cv2.imshow("Genshin Assistant Debug", debug_frame)
+                        except cv2.error as e:
+                            print(f"[WARN] cv2.imshow error: {e}")
+                            break
 
-                        # Display Tuner Mask thumbnail
-                        _, _, gold_mask, _, _, _ = self.detector.track_quest_marker(
-                            frame, self.config, self.frame_idx, self.last_template_lock
-                        )
-                        mask_display = cv2.cvtColor(cv2.resize(gold_mask, (480, 270)), cv2.COLOR_GRAY2BGR)
-                        cv2.putText(
-                            mask_display,
-                            "Quest Mask Preview (Stamina Masked Out)",
-                            (15, 25),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.50,
-                            (0, 255, 255),
-                            1,
-                        )
-                        cv2.imshow(TUNER_WINDOW, mask_display)
+                        # Handle Hotkeys safely
+                        try:
+                            key = cv2.waitKey(1) & 0xFF
+                        except cv2.error:
+                            break
 
-                        # Handle Hotkeys
-                        key = cv2.waitKey(1) & 0xFF
                         if key in (ord("q"), ord("Q"), 27):
                             print("\n[INFO] Clean exit requested by user.")
                             break
@@ -1439,7 +1263,7 @@ class GenshinAssistant:
                             if save_config(self.config):
                                 self.save_banner_until = time.time() + 2.0
                         elif key in (ord("d"), ord("D")):
-                            self.reset_tuner_to_defaults()
+                            self.reset_config_to_defaults()
                         elif key in (ord("t"), ord("T")):
                             self.capture_active_diamond_template()
 
@@ -1790,8 +1614,8 @@ class GenshinAssistant:
         quest_bearing, road_bearing, has_road = self.detector.analyze_minimap_road_and_quest(frame)
         self.active_road_following = has_road
 
-        # 5. Hybrid 30f Multi-Scale Template Scan + 110x110 Local Tracking
-        centroid, marker_type, _, bbox, score, scan_mode = self.detector.track_quest_marker(
+        # 5. Pure Template-Based Multi-Scale Quest Tracking (30f Multi-Scale Scan + 110x110 Local Tracking)
+        centroid, marker_type, bbox, score, scan_mode = self.detector.track_quest_marker(
             frame, self.config, self.frame_idx, self.last_template_lock
         )
         self.active_marker_type = marker_type
@@ -1906,7 +1730,13 @@ class GenshinAssistant:
         if now - self.last_mouse_packet_time < 0.055:
             return
 
-        kp = max(0.01, float(self.config["Kp_x100"]) / 100.0)
+        if "Kp" in self.config:
+            kp = float(self.config["Kp"])
+        elif "Kp_x100" in self.config:
+            kp = float(self.config["Kp_x100"]) / 100.0
+        else:
+            kp = 0.14
+        kp = max(0.01, min(0.50, kp))
 
         noise = random.gauss(0, 2.0)
         overshoot = random.uniform(0.85, 1.15)
@@ -2087,10 +1917,10 @@ class GenshinAssistant:
             cv2.rectangle(debug_frame, (500, 50), (780, 95), (0, 140, 0), -1)
             cv2.putText(debug_frame, "CONFIG SAVED!", (535, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
-        # Reset Tuner notification
+        # Reset Defaults notification
         if time.time() < self.reset_banner_until:
             cv2.rectangle(debug_frame, (430, 50), (850, 95), (0, 100, 220), -1)
-            cv2.putText(debug_frame, "TUNER RESET TO DEFAULTS!", (450, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+            cv2.putText(debug_frame, "CONFIG RESET TO DEFAULTS!", (450, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
         # Template Captured notification
         if time.time() < self.template_banner_until:
@@ -2129,7 +1959,10 @@ class GenshinAssistant:
             self.hid.press_r()
             self.is_aiming_bow = False
         self.hid.close()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         print("[CLEANUP] Genshin Assistant terminated safely.")
 
 
@@ -2137,12 +1970,12 @@ class GenshinAssistant:
 # CLI Entrypoint
 # ==============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Genshin Impact CV Automation with ESP32-S3 HID (v3.4 Production)")
+    parser = argparse.ArgumentParser(description="Genshin Impact CV Automation with ESP32-S3 HID (v4 Production)")
     parser.add_argument("--port", type=str, default="COM4", help="Serial COM port of ESP32-S3 (default: COM4)")
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run screen capture, state machine, and tuner without requiring physical ESP32-S3 connected",
+        help="Run screen capture, state machine, and template tracker without requiring physical ESP32-S3 connected",
     )
     parser.add_argument(
         "--capture-icon",
