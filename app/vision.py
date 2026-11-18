@@ -40,7 +40,8 @@ from app.config_manager import (
 
 
 class VisionDetector:
-    def __init__(self):
+    def __init__(self, logger: Optional[Any] = None):
+        self.logger = logger
         self.minimap_template = None
         self.choice_template = None
         self.quest_gold_template = None
@@ -48,6 +49,14 @@ class VisionDetector:
         self.quest_blue_template = None
         self.quest_blue_template_gray = None
         self.reload_templates()
+
+        # YOLOv8-Nano ONNX Runtime Wrapper (Intel Arc GPU DirectML)
+        try:
+            from app.yolo_detector import YoloUIWrapper
+            self.yolo = YoloUIWrapper(logger=self.logger)
+        except Exception:
+            self.yolo = None
+        self.latest_yolo_detections: List[Dict[str, Any]] = []
 
         # Precompute circular minimap mask for road & quest extraction
         self.minimap_circle_mask = np.zeros((TARGET_HEIGHT, TARGET_WIDTH), dtype=np.uint8)
@@ -105,6 +114,12 @@ class VisionDetector:
 
     def check_choice_icon(self, frame_bgr: np.ndarray) -> Tuple[bool, Optional[Tuple[int, int, int, int]]]:
         """Detect dialogue speech-bubble / choice icon in middle-right ROI."""
+        # Check YOLO detections first if active
+        if self.yolo and self.yolo.is_ready and self.latest_yolo_detections:
+            choices = self.yolo.get_dialogue_choices(self.latest_yolo_detections)
+            if choices:
+                return True, choices[0]["box"]
+
         y1, y2, x1, x2 = ROI_CHOICE
         roi = frame_bgr[y1:y2, x1:x2]
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -135,6 +150,206 @@ class VisionDetector:
                     return True, (x1 + bx, y1 + by, bw, bh)
 
         return False, None
+
+    def get_minimap_player_yaw(self, frame_bgr: np.ndarray) -> Optional[float]:
+        """
+        Extract player arrow orientation from the inner minimap circle (r <= 16 px).
+        Segments bright white/cyan directional player arrow (S <= 75, V >= 215).
+        Returns principal orientation angle in degrees [-180.0, 180.0] (0 = North/Up, +90 = East/Right).
+        """
+        cx, cy = MINIMAP_CENTER
+        r = 16
+        if frame_bgr is None or frame_bgr.size == 0:
+            return None
+
+        # Extract 33x33 inner disk ROI
+        roi = frame_bgr[cy - r : cy + r + 1, cx - r : cx + r + 1]
+        if roi.shape[0] != 2 * r + 1 or roi.shape[1] != 2 * r + 1:
+            return None
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
+
+        # Inner circular mask
+        y_grid, x_grid = np.ogrid[: 2 * r + 1, : 2 * r + 1]
+        dist_from_center = np.hypot(x_grid - r, y_grid - r)
+        circle_mask = (dist_from_center <= r)
+
+        # White/cyan arrow segmentation: S <= 75, V >= 215
+        arrow_mask = (sat <= 75) & (val >= 215) & circle_mask
+        arrow_pts = np.argwhere(arrow_mask)  # rows, cols = y, x
+
+        if len(arrow_pts) < 10:
+            return None
+
+        # Points (x, y) relative to center (r, r)
+        xs = arrow_pts[:, 1].astype(np.float32)
+        ys = arrow_pts[:, 0].astype(np.float32)
+
+        mean_x = np.mean(xs)
+        mean_y = np.mean(ys)
+
+        # Fit orientation line via cv2.fitLine
+        pts_2d = np.column_stack([xs, ys])
+        line = cv2.fitLine(pts_2d, cv2.DIST_L2, 0, 0.01, 0.01)
+        vx = float(line[0][0])
+        vy = float(line[1][0])
+
+        # Resolve 180° ambiguity: arrow tip is farther from centroid than the base wings
+        projections = (xs - mean_x) * vx + (ys - mean_y) * vy
+        max_proj = np.max(projections)
+        min_proj = np.min(projections)
+
+        if abs(min_proj) > max_proj:
+            tip_vx = -vx
+            tip_vy = -vy
+        else:
+            tip_vx = vx
+            tip_vy = vy
+
+        # Up is -y (0 deg), Right is +x (+90 deg)
+        yaw_rad = math.atan2(tip_vx, -tip_vy)
+        yaw_deg = math.degrees(yaw_rad)
+        return float(yaw_deg)
+
+    def analyze_minimap_radar(self, frame_bgr: np.ndarray) -> Dict[str, Any]:
+        """
+        2D Minimap Radar + V-Trail Path Extraction.
+        Circular minimap (cx=114, cy=96, r=68) acts as primary navigation compass:
+        - Detects Gold or Blue objective blips (18 <= r <= 66 px) -> objective_bearing_deg, objective_dist_px.
+        - Detects Genshin's 'V' golden breadcrumb trail (24 <= r <= 48 px) -> trail_bearing_deg.
+        - Fuses trail and objective bearings for obstacle/cliff avoidance navigation.
+        - Extracts player arrow yaw for closed-loop turning.
+        """
+        cx, cy = MINIMAP_CENTER
+        r = MINIMAP_RADIUS
+
+        result = {
+            "objective_bearing_deg": None,
+            "objective_dist_px": None,
+            "blip_type": None,
+            "trail_bearing_deg": None,
+            "target_bearing_deg": None,
+            "steering_source": "NONE",
+            "player_yaw_deg": None,
+        }
+
+        if frame_bgr is None or frame_bgr.size == 0:
+            return result
+
+        result["player_yaw_deg"] = self.get_minimap_player_yaw(frame_bgr)
+
+        mini_roi = frame_bgr[cy - r : cy + r, cx - r : cx + r]
+        if mini_roi.shape[0] != 2 * r or mini_roi.shape[1] != 2 * r:
+            return result
+
+        hsv_mini = cv2.cvtColor(mini_roi, cv2.COLOR_BGR2HSV)
+        val_mini = hsv_mini[:, :, 2]
+
+        # Annulus mask: 18 <= r <= 66 px
+        annulus_blip = np.zeros((2 * r, 2 * r), dtype=np.uint8)
+        cv2.circle(annulus_blip, (r, r), 66, 255, -1)
+        cv2.circle(annulus_blip, (r, r), 18, 0, -1)
+
+        # 1. Objective Blip Detection
+        # Gold: H 19..35, S 175..255, V 205..255
+        gold_mask = cv2.inRange(hsv_mini, np.array([19, 175, 205]), np.array([35, 255, 255]))
+        gold_in_annulus = cv2.bitwise_and(gold_mask, annulus_blip)
+
+        # Blue: H 94..116, S 140..255, V 195..255
+        blue_mask = cv2.inRange(hsv_mini, np.array([94, 140, 195]), np.array([116, 255, 255]))
+        blue_in_annulus = cv2.bitwise_and(blue_mask, annulus_blip)
+
+        best_blip = None
+
+        # Gold blips
+        q_contours, _ = cv2.findContours(gold_in_annulus, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for qc in q_contours:
+            area = cv2.contourArea(qc)
+            if 10 <= area <= 75:
+                bx, by, bw, bh = cv2.boundingRect(qc)
+                if bh > 0 and 0.5 <= float(bw) / float(bh) <= 2.0:
+                    if self._has_dark_outline(val_mini, qc, bx, by, bw, bh) or area >= 14:
+                        M = cv2.moments(qc)
+                        if M["m00"] > 0:
+                            qx = M["m10"] / M["m00"]
+                            qy = M["m01"] / M["m00"]
+                            best_blip = (qx, qy, "GOLD", area)
+                            break
+
+        # Blue blips
+        if best_blip is None:
+            b_contours, _ = cv2.findContours(blue_in_annulus, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for bc in b_contours:
+                area = cv2.contourArea(bc)
+                if 10 <= area <= 75:
+                    bx, by, bw, bh = cv2.boundingRect(bc)
+                    if bh > 0 and 0.5 <= float(bw) / float(bh) <= 2.0:
+                        M = cv2.moments(bc)
+                        if M["m00"] > 0:
+                            qx = M["m10"] / M["m00"]
+                            qy = M["m01"] / M["m00"]
+                            best_blip = (qx, qy, "BLUE", area)
+                            break
+
+        if best_blip is not None:
+            qx, qy, btype, _ = best_blip
+            p_dx = qx - r
+            p_dy = qy - r
+            obj_dist = float(math.hypot(p_dx, p_dy))
+            obj_bearing = float(math.degrees(math.atan2(p_dx, -p_dy)))
+            result["objective_dist_px"] = obj_dist
+            result["objective_bearing_deg"] = obj_bearing
+            result["blip_type"] = btype
+
+        # 2. Genshin 'V' Golden Navigation Trail
+        # H 20..36, S 150..255, V 200..255 along 24 <= r <= 48 px
+        trail_mask = cv2.inRange(hsv_mini, np.array([20, 150, 200]), np.array([36, 255, 255]))
+        trail_annulus = np.zeros((2 * r, 2 * r), dtype=np.uint8)
+        cv2.circle(trail_annulus, (r, r), 48, 255, -1)
+        cv2.circle(trail_annulus, (r, r), 24, 0, -1)
+        trail_mid = cv2.bitwise_and(trail_mask, trail_annulus)
+
+        # Mask out the objective blip so diamond pixels are not mistaken for trail path
+        if best_blip is not None:
+            cv2.circle(trail_mid, (int(best_blip[0]), int(best_blip[1])), 10, 0, -1)
+
+        trail_pts = np.argwhere(trail_mid > 0)
+        if len(trail_pts) >= 6:
+            ref_bearing = result["objective_bearing_deg"]
+            valid_pts = []
+            for pt in trail_pts:
+                py, px = pt[0], pt[1]
+                p_dx = px - r
+                p_dy = py - r
+                p_bearing = math.degrees(math.atan2(p_dx, -p_dy))
+                if ref_bearing is not None:
+                    diff = (p_bearing - ref_bearing + 180.0) % 360.0 - 180.0
+                    if abs(diff) <= 90.0:  # forward hemisphere
+                        valid_pts.append((px, py))
+                else:
+                    valid_pts.append((px, py))
+
+            if len(valid_pts) >= 6:
+                v_arr = np.array(valid_pts)
+                mean_tx = float(np.mean(v_arr[:, 0]))
+                mean_ty = float(np.mean(v_arr[:, 1]))
+                t_bearing = float(math.degrees(math.atan2(mean_tx - r, -(mean_ty - r))))
+                result["trail_bearing_deg"] = t_bearing
+
+        # 3. Steering Fusion
+        if result["trail_bearing_deg"] is not None and result["objective_dist_px"] is not None and result["objective_dist_px"] > 24.0:
+            result["target_bearing_deg"] = result["trail_bearing_deg"]
+            result["steering_source"] = "TRAIL"
+        elif result["objective_bearing_deg"] is not None:
+            result["target_bearing_deg"] = result["objective_bearing_deg"]
+            result["steering_source"] = "OBJECTIVE"
+        else:
+            result["target_bearing_deg"] = None
+            result["steering_source"] = "NONE"
+
+        return result
 
     def analyze_minimap_road_and_quest(
         self, frame_bgr: np.ndarray
@@ -230,6 +445,17 @@ class VisionDetector:
         Combat trigger: Strict horizontal HP-bar geometry filtering inside x: 160..1120, y: 120..560.
         Excludes the top sky strip (y < 120) and bottom HUD (y > 560).
         """
+        # Check YOLO detections first if active
+        if self.yolo and self.yolo.is_ready and self.latest_yolo_detections:
+            yolo_bars = self.yolo.get_enemy_hp_bars(self.latest_yolo_detections)
+            if yolo_bars:
+                largest = max(yolo_bars, key=lambda b: b["box"][2] * b["box"][3])
+                bx, by, bw, bh = largest["box"]
+                cx, cy = largest["centroid"]
+                area = float(bw * bh)
+                is_elevated = (cy < 290)
+                return True, len(yolo_bars), area, (cx, cy), is_elevated, (bx, by, bw, bh)
+
         y1, y2, x1, x2 = ROI_COMBAT
         roi = frame_bgr[y1:y2, x1:x2]
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -338,6 +564,12 @@ class VisionDetector:
         1. Square bright keycap (18 <= bw <= 36, 18 <= bh <= 36, aspect 0.80..1.25, mean V > 200) on left side (x: 735..830)
         2. Dark translucent pill strip immediately to its right (x+bw+8..x+bw+95, mean V < 95) with bright white label text (V > 210 count >= 18).
         """
+        # Check YOLO detections first if active
+        if self.yolo and self.yolo.is_ready and self.latest_yolo_detections:
+            yolo_f = self.yolo.get_f_prompt(self.latest_yolo_detections)
+            if yolo_f:
+                return True, yolo_f["box"]
+
         y1, y2, x1, x2 = ROI_INTERACT
         roi = frame_bgr[y1:y2, x1:x2]
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -456,6 +688,13 @@ class VisionDetector:
         dark_count = int(np.count_nonzero(ring_pixels < 125))
         return (float(dark_count) / float(ring_pixels.size)) >= 0.35
 
+    def update_yolo_frame(self, frame_bgr: np.ndarray):
+        """Runs YOLOv8n ONNX inference once per frame if active."""
+        if self.yolo and self.yolo.is_ready and frame_bgr is not None:
+            self.latest_yolo_detections = self.yolo.infer(frame_bgr)
+        else:
+            self.latest_yolo_detections = []
+
     def detect_direct_diamonds(
         self,
         roi_bgr: np.ndarray,
@@ -473,6 +712,18 @@ class VisionDetector:
         - Outline Contrast: >= 35% of dilated outline ring pixels have V < 125.
         - Direct diamond scores are capped at 0.58.
         """
+        # Check YOLO detections first if active
+        if self.yolo and self.yolo.is_ready and self.latest_yolo_detections:
+            yolo_marker = self.yolo.get_quest_marker(self.latest_yolo_detections)
+            if yolo_marker:
+                m_type = "GOLD" if yolo_marker["class_name"] == "quest_gold" else "BLUE"
+                return [{
+                    "centroid": yolo_marker["centroid"],
+                    "type": m_type,
+                    "bbox": yolo_marker["box"],
+                    "score": float(yolo_marker["confidence"]),
+                }]
+
         val_roi = hsv_roi[:, :, 2]
         candidates = []
 

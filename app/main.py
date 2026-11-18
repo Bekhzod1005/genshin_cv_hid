@@ -128,15 +128,22 @@ def is_genshin_focused(hwnd: int) -> bool:
 
 
 class GenshinAssistantApp:
-    def __init__(self, port: str = "COM4", dry_run: bool = False, capture_icon_mode: Optional[str] = None):
+    def __init__(
+        self,
+        port: str = "COM4",
+        dry_run: bool = False,
+        capture_icon_mode: Optional[str] = None,
+        collect_bg: bool = False,
+    ):
         self.port = port
         self.dry_run = dry_run
         self.capture_icon_mode = capture_icon_mode
+        self.collect_bg = collect_bg
 
         self.logger = FlightLogger()
         self.config = load_config()
         self.hid = ESP32HIDController(port=self.port, dry_run=self.dry_run, logger=self.logger)
-        self.detector = VisionDetector()
+        self.detector = VisionDetector(logger=self.logger)
         self.sm = AssistantStateMachine(self.hid, self.detector, self.config, logger=self.logger)
 
         self.prev_is_focused: Optional[bool] = None
@@ -265,15 +272,19 @@ class GenshinAssistantApp:
         current_fps = 0.0
         frame_idx = 0
 
+        bg_count = 0
+        last_bg_collect_time = 0.0
+
         print("\n" + "=" * 70)
         print(" Genshin Impact CV Assistant Running (v5 Modular Production)")
         print(" Hierarchy: DIALOGUE > COMBAT_AUTO > CHEST_LOOT > NAVIGATE")
-        print(" Steering : Two-Zone PD (28 Hz) + Off-Screen Minimap Pivot-in-Place")
+        print(" Radar    : 2D Minimap Radar + V-Trail Navigation (Closed-Loop Yaw)")
         print(" Combat   : Strict HP Bar Geometry + Non-Blocking Amber Aim Tracker")
-        print(" Quests   : Pure Template Tracking + Concentric Contrast Verification")
+        print(" Vision   : YOLOv8-Nano (Intel Arc DirectML) + Template Hybrid Fallback")
         print(" Unstuck  : Staged Non-Blocking Recovery (0.8s hop, 1.7s turn+hop)")
         print(" Hotkeys:")
         print("   [F12] : Instant Global Pause / Resume Toggle")
+        print("   [C]   : Calibrate Camera Yaw (Minimap Player Arrow)")
         print("   [T]   : Crop & Save 28x28 Diamond Template (or Left-Click Screen)")
         print("   [D]   : Reset Configuration to Hardcoded Defaults")
         print("   [S]   : Save active settings to config.json")
@@ -327,6 +338,25 @@ class GenshinAssistantApp:
 
                     self.latest_frame = frame
                     frame_half = cv2.resize(frame, (HALF_WIDTH, HALF_HEIGHT))
+
+                    # Background Collection Mode (--collect-bg)
+                    if self.collect_bg:
+                        bg_dir = os.path.join("dataset", "backgrounds")
+                        os.makedirs(bg_dir, exist_ok=True)
+                        if is_focused and (now - last_bg_collect_time >= 0.12):
+                            bg_path = os.path.join(bg_dir, f"bg_{bg_count:03d}.png")
+                            cv2.imwrite(bg_path, frame)
+                            bg_count += 1
+                            last_bg_collect_time = now
+                            if bg_count % 25 == 0 or bg_count >= 150:
+                                print(f"[COLLECT-BG] Captured {bg_count}/150 gameplay frames...")
+                            if bg_count >= 150:
+                                print("[COLLECT-BG] Background collection complete (150 frames)! Exiting.")
+                                if self.logger:
+                                    self.logger.log_event("BOOT", "Background collection complete (150 frames).")
+                                break
+                        time.sleep(0.01)
+                        continue
 
                     # 3. SAFETY GUARD: Active-Window Focus Check & F12 Pause
                     if not is_focused or self.global_paused:
@@ -401,19 +431,28 @@ class GenshinAssistantApp:
                             self.reset_config_to_defaults()
                         elif key in (ord("t"), ord("T")):
                             self.capture_active_diamond_template()
+                        elif key in (ord("c"), ord("C")):
+                            self.sm.trigger_yaw_calibration()
 
             finally:
                 self.cleanup()
 
     def _draw_hud(self, debug_frame: np.ndarray, fps: float, is_focused: bool):
         """Draw bounding boxes, telemetry stats, reticles, and hotkey banners on debug frame."""
-        # 1. Minimap Circle ROI (Cyan)
+        # Draw YOLOv8-Nano Detections if active
+        if getattr(self.detector, "latest_yolo_detections", None) and getattr(self.detector, "yolo", None):
+            self.detector.yolo.draw_detections(debug_frame, self.detector.latest_yolo_detections)
+
+        # 1. Minimap Circle ROI (Cyan) & Inner Player Circle
         cv2.circle(debug_frame, MINIMAP_CENTER, MINIMAP_RADIUS, (255, 255, 0), 1)
-        road_tag = "Road: ON" if self.sm.active_road_following else "Road: OFF"
+        cv2.circle(debug_frame, MINIMAP_CENTER, 16, (200, 200, 200), 1)
+        radar_tag = f"Radar: {self.sm.radar_source}"
+        if self.sm.radar_target_bearing_deg is not None:
+            radar_tag += f" {self.sm.radar_target_bearing_deg:+.1f}deg"
         cv2.putText(
             debug_frame,
-            road_tag,
-            (MINIMAP_CENTER[0] - 28, MINIMAP_CENTER[1] + 82),
+            radar_tag,
+            (MINIMAP_CENTER[0] - 40, MINIMAP_CENTER[1] + 82),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.38,
             (255, 255, 0),
@@ -598,13 +637,13 @@ class GenshinAssistantApp:
 
         # Bottom Hotkey Bar
         cv2.rectangle(debug_frame, (0, TARGET_HEIGHT - 32), (TARGET_WIDTH, TARGET_HEIGHT), (25, 25, 25), -1)
-        hotkey_text = "[F12] Pause | [T] Capture Template | [D] Reset Defaults | [S] Save | [Q] Exit"
+        hotkey_text = "[F12] Pause | [C] Calib Yaw | [T] Capture Template | [D] Reset Defaults | [S] Save | [Q] Exit"
         cv2.putText(
             debug_frame,
             hotkey_text,
-            (TARGET_WIDTH // 2 - 310, TARGET_HEIGHT - 10),
+            (TARGET_WIDTH // 2 - 340, TARGET_HEIGHT - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
+            0.50,
             (220, 220, 220),
             1,
         )
@@ -676,9 +715,19 @@ def main():
         default=None,
         help="Run in diamond icon capture mode: specify 'gold' or 'blue'",
     )
+    parser.add_argument(
+        "--collect-bg",
+        action="store_true",
+        help="Capture 150 gameplay frames (1 frame every 0.12s while focused, no HID output) into dataset/backgrounds/ and exit",
+    )
     args = parser.parse_args()
 
-    app = GenshinAssistantApp(port=args.port, dry_run=args.dry_run, capture_icon_mode=args.capture_icon)
+    app = GenshinAssistantApp(
+        port=args.port,
+        dry_run=args.dry_run,
+        capture_icon_mode=args.capture_icon,
+        collect_bg=args.collect_bg,
+    )
     app.run()
 
 

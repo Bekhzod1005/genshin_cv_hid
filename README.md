@@ -268,6 +268,18 @@ Runs screen capture, template tracker, and state machine preview with no serial 
 python app/main.py --dry-run
 ```
 
+### Background Collection Mode (For YOLO Dataset)
+Captures 150 diverse gameplay frames while focused into `dataset/backgrounds/` and exits automatically:
+```powershell
+python app/main.py --collect-bg
+```
+
+### Automated Synthetic YOLOv8n Training & ONNX Export
+Synthesizes 1,500 labeled 640x640 images across 5 classes, trains YOLOv8n, and exports `assets/genshin_yolov8n.onnx`:
+```powershell
+python tools/auto_train_yolo.py --epochs 35 --num-images 1500
+```
+
 ---
 
 ## Controls & Hotkeys
@@ -275,6 +287,7 @@ python app/main.py --dry-run
 | Hotkey | Context | Action |
 |---|---|---|
 | **`F12`** | Global (Any Window) | **Instant Pause / Resume Toggle**. Immediately releases all held keys (`STOP`), clears queues, and suspends automation. |
+| **`C`** | Debug Window | **Calibrate Camera Yaw**. Runs closed-loop transfer function calibration against the minimap player arrow to calibrate `counts_per_degree`. |
 | **`T`** | Debug Window | **Capture Active Diamond Template**. Crops a 28x28 patch around the tracked marker and saves to `assets/quest_gold.png` or `assets/quest_blue.png`. |
 | **Mouse Click** | Debug Window | **Crop Template At Cursor**. Left-click on any quest diamond on the live debug window to instantly save a 28x28 reference template. |
 | **`D`** | Debug Window | **Reset Configuration to Defaults**. Restores hardcoded defaults (`Kp_fine = 0.16`, `Kd = 0.06`, `Kp_fast = 0.26`, `steer_rate_hz = 20`, `threshold = 0.50`, etc.) and updates `config.json`. |

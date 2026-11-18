@@ -24,3 +24,9 @@ $RECYCLE.BIN/
 # Test / debug logs
 *.log
 logs/
+
+# Machine learning datasets & runs
+dataset/
+runs/
+*.pt
+

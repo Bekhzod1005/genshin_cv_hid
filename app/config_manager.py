@@ -95,6 +95,8 @@ HARDCODED_DEFAULTS = {
     "quest_v_pulse_cooldown": 5.0,
     "lost_marker_v_delay": 0.8,
     "lost_marker_sweep_delay": 1.8,
+    "counts_per_degree": 0.65,
+    "yaw_calibrated": False,
 }
 
 DEFAULT_CONFIG = HARDCODED_DEFAULTS.copy()

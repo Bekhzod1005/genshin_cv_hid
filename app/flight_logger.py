@@ -40,7 +40,7 @@ class FlightLogger:
         """Logs a timestamped telemetry entry with a category tag.
         
         Args:
-            tag: Category tag (e.g. 'BOOT', 'FOCUS', 'STATE', 'NAV', 'VISION', 'UNSTUCK', 'HID', 'TELEM').
+            tag: Category tag (e.g. 'BOOT', 'FOCUS', 'STATE', 'NAV', 'VISION', 'CALIB', 'YOLO', 'UNSTUCK', 'HID', 'TELEM').
             message: Informational trace or snapshot string.
         """
         if self._closed or not self.file:

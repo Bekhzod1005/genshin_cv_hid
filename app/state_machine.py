@@ -23,6 +23,7 @@ from app.config_manager import (
     STATE_NAVIGATE,
     dialogue_advance_delay,
     play_alert_chime,
+    save_config,
 )
 from app.controller import ESP32HIDController, PDSteeringController
 from app.vision import VisionDetector
@@ -74,9 +75,21 @@ class AssistantStateMachine:
 
         # Camera-Locked Sprint with Hysteresis Drift Corridor
         self.nav_mode: str = "ALIGN"  # "ALIGN" (stationary centering) or "CRUISE_LOCKED" (forward sprint, dx=0)
-        self.cruise_source: str = "3D"  # "3D" or "MINIMAP"
+        self.cruise_source: str = "3D"  # "3D" or "MINIMAP" or "RADAR"
         self.align_pitch_steps: int = 0  # Number of upward pitch steps taken in current ALIGN cycle (max 3)
         self.needs_pitch_reset: bool = True  # Automatic upward camera pitch reset on entering navigation
+
+        # 2D Minimap Radar & Camera Yaw Calibration
+        self.counts_per_degree: float = float(self.config.get("counts_per_degree", 0.65))
+        self.yaw_calibrated: bool = bool(self.config.get("yaw_calibrated", False))
+        self.calibration_phase: str = "IDLE"  # IDLE, START, WAIT_SETTLE
+        self.calib_yaw_0: Optional[float] = None
+        self.calib_pulse_sent_time: float = 0.0
+        self.next_turn_ready_time: float = 0.0
+        self.radar_target_bearing_deg: Optional[float] = None
+        self.radar_trail_bearing_deg: Optional[float] = None
+        self.radar_dist_px: Optional[float] = None
+        self.radar_source: str = "NONE"
 
         # Staged Obstacle Unstuck State Machine (0.8s hop, 1.7s lateral turn + hop)
         self.prev_ground_gray_half: Optional[np.ndarray] = None
@@ -162,11 +175,16 @@ class AssistantStateMachine:
         else:
             bearing_str = "None"
 
+        trail_str = f"{self.radar_trail_bearing_deg:+.1f}deg" if self.radar_trail_bearing_deg is not None else "None"
+        cpd = float(self.config.get("counts_per_degree", self.counts_per_degree))
+
         telem_str = (
             f"state={self.current_state} nav={self.nav_mode} walk={self.hid.is_walking} | "
             f"minimap={minimap_present}({minimap_score:.2f}) | "
             f"marker={marker_str} | "
             f"mini_bearing={bearing_str} | "
+            f"trail_bearing={trail_str} | "
+            f"counts_per_deg={cpd:.3f} | "
             f"f_prompt={f_prompt} | "
             f"motion={self.smooth_motion_score:.2f}"
         )
@@ -183,8 +201,62 @@ class AssistantStateMachine:
                     msg += f" ({reason})"
                 self.logger.log_event("NAV", msg)
 
+    def trigger_yaw_calibration(self):
+        """Requests camera yaw calibration on next navigation step."""
+        print("[CALIB] Yaw calibration requested.")
+        self.calibration_phase = "START"
+        self.yaw_calibrated = False
+
+    def calibrate_yaw(
+        self,
+        frame: Optional[np.ndarray] = None,
+        wait_func=time.sleep,
+        next_frame: Optional[np.ndarray] = None,
+    ) -> bool:
+        """
+        Synchronous camera yaw calibration against minimap player arrow.
+        1. Ensures walking stopped (W0).
+        2. Measures initial yaw_0.
+        3. Sends M45,0 pulse and waits 0.18s.
+        4. Measures yaw_1 and calculates counts_per_degree.
+        """
+        self.hid.stop_walk()
+        if frame is None:
+            return False
+
+        yaw_0 = self.detector.get_minimap_player_yaw(frame)
+        if yaw_0 is None:
+            print("[CALIB WARN] Could not detect player arrow on minimap for yaw calibration.")
+            return False
+
+        self.hid.move_mouse(45, 0)
+        wait_func(0.18)
+
+        # Re-check frame after pulse
+        f1 = next_frame if next_frame is not None else frame
+        yaw_1 = self.detector.get_minimap_player_yaw(f1)
+        if yaw_1 is None:
+            return False
+
+        delta_deg = (yaw_1 - yaw_0 + 180.0) % 360.0 - 180.0
+        abs_delta = abs(delta_deg)
+        if abs_delta >= 2.0:
+            new_cpd = max(0.30, min(1.80, 45.0 / abs_delta))
+            self.counts_per_degree = round(new_cpd, 3)
+            self.config["counts_per_degree"] = self.counts_per_degree
+            self.config["yaw_calibrated"] = True
+            self.yaw_calibrated = True
+            save_config(self.config)
+            msg = f"Measured delta={delta_deg:.1f} deg -> counts_per_degree={self.counts_per_degree:.3f}"
+            print(f"[CALIB] {msg}")
+            if self.logger:
+                self.logger.log_event("CALIB", msg)
+            return True
+        return False
+
     def process_frame(self, frame: np.ndarray, frame_half: np.ndarray, frame_idx: int):
         now = time.time()
+        self.detector.update_yolo_frame(frame)
         self.detected_party_size = self.detector.detect_party_size(frame)
 
         # ----------------------------------------------------------------------
@@ -628,7 +700,49 @@ class AssistantStateMachine:
                     self.logger.log_event("NAV", f"Dispatched pitch reset upward (dy={pitch_counts})")
             self.needs_pitch_reset = False
 
-        # 3. Overworld [F] Prompt Detection (Keycap + Dark Pill Strip)
+        # 3. Closed-Loop Camera Yaw Calibration Check
+        if not self.yaw_calibrated and self.calibration_phase == "IDLE":
+            self.calibration_phase = "START"
+
+        if self.calibration_phase == "START":
+            self.hid.stop_walk()
+            yaw_0 = self.detector.get_minimap_player_yaw(frame)
+            if yaw_0 is not None:
+                self.calib_yaw_0 = yaw_0
+                self.hid.move_mouse(45, 0)
+                self.calib_pulse_sent_time = now
+                self.calibration_phase = "WAIT_SETTLE"
+                msg = f"Yaw calibration started: measured yaw_0={yaw_0:.1f} deg, sent M45,0 pulse, settling 0.18s"
+                print(f"[CALIB] {msg}")
+                if self.logger:
+                    self.logger.log_event("CALIB", msg)
+            self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=False)
+            return
+
+        elif self.calibration_phase == "WAIT_SETTLE":
+            if now - self.calib_pulse_sent_time >= 0.18:
+                yaw_1 = self.detector.get_minimap_player_yaw(frame)
+                if yaw_1 is not None and self.calib_yaw_0 is not None:
+                    delta_deg = (yaw_1 - self.calib_yaw_0 + 180.0) % 360.0 - 180.0
+                    abs_delta = abs(delta_deg)
+                    if abs_delta >= 2.0:
+                        new_cpd = max(0.30, min(1.80, 45.0 / abs_delta))
+                        self.counts_per_degree = round(new_cpd, 3)
+                        self.config["counts_per_degree"] = self.counts_per_degree
+                        self.config["yaw_calibrated"] = True
+                        self.yaw_calibrated = True
+                        save_config(self.config)
+                        msg = f"Measured delta={delta_deg:.1f} deg -> counts_per_degree={self.counts_per_degree:.3f}"
+                        print(f"[CALIB] {msg}")
+                        if self.logger:
+                            self.logger.log_event("CALIB", msg)
+                    else:
+                        print(f"[CALIB WARN] Measured delta too small ({delta_deg:.1f} deg). Retaining counts_per_degree={self.counts_per_degree:.3f}")
+                self.calibration_phase = "IDLE"
+            self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=False)
+            return
+
+        # 4. Overworld [F] Prompt Detection (Keycap + Dark Pill Strip)
         f_prompt_detected, prompt_box = self.detector.detect_overworld_f_prompt(frame)
         if f_prompt_detected and prompt_box:
             self.f_prompt_consecutive_frames += 1
@@ -710,23 +824,79 @@ class AssistantStateMachine:
             self.unstuck_still_start_time = 0.0
             self.unstuck_stage = 0
 
-        # 5. Minimap Quest Bearing & Road Segmentation
-        quest_bearing, road_bearing, has_road, blip_type = self.detector.analyze_minimap_road_and_quest(frame)
-        self.active_road_following = has_road
-        self.minimap_quest_bearing = quest_bearing
+        # 5. 2D Minimap Radar + V-Trail Path Extraction
+        radar = self.detector.analyze_minimap_radar(frame)
+        target_bearing_deg = radar["target_bearing_deg"]
+        obj_dist_px = radar["objective_dist_px"]
+        trail_bearing_deg = radar["trail_bearing_deg"]
+        self.radar_trail_bearing_deg = trail_bearing_deg
+        self.radar_target_bearing_deg = target_bearing_deg
+        self.radar_dist_px = obj_dist_px
+        self.radar_source = radar["steering_source"]
 
-        if quest_bearing is not None:
-            if not self.prev_minimap_bearing_visible:
-                self.prev_minimap_bearing_visible = True
-                if self.logger:
-                    self.logger.log_event("VISION", f"Minimap quest bearing DETECTED: {math.degrees(quest_bearing):+.1f} deg (blip_type={blip_type})")
+        if radar["objective_bearing_deg"] is not None:
+            self.minimap_quest_bearing = math.radians(radar["objective_bearing_deg"])
         else:
-            if self.prev_minimap_bearing_visible:
-                self.prev_minimap_bearing_visible = False
-                if self.logger:
-                    self.logger.log_event("VISION", "Minimap quest bearing LOST")
+            self.minimap_quest_bearing = None
 
-        # 6. Hybrid Quest Tracking (Template Matching + Direct Diamond HSV & Dark Outline)
+        # Primary Sensor: 2D Minimap Radar + V-Trail Navigation
+        # 3D marker is demoted to terminal approach only (objective_dist_px <= 26 px)
+        if target_bearing_deg is not None and (obj_dist_px is None or obj_dist_px > 26.0):
+            if self.nav_mode == "CRUISE_LOCKED":
+                if abs(target_bearing_deg) > 28.0:
+                    print(f"[NAV] Exiting CRUISE_LOCKED -> ALIGN: Target bearing drift (|{target_bearing_deg:.1f}| > 28 deg)")
+                    if self.logger:
+                        self.logger.log_event("NAV", f"Mode CRUISE_LOCKED -> ALIGN (target_bearing={target_bearing_deg:.1f} deg > 28 deg)")
+                    self.nav_mode = "ALIGN"
+                    self.align_pitch_steps = 0
+                    self.hid.stop_walk()
+                else:
+                    # Maintain forward walk and periodic sprint bursts
+                    if not self.hid.is_walking and not self.vacuum_active:
+                        self.hid.start_walk()
+
+                    if self.hid.is_walking:
+                        if now - self.last_sprint_time >= self.next_sprint_interval:
+                            self.hid.click_rmb()
+                            self.last_sprint_time = now
+                            self.next_sprint_interval = random.uniform(2.2, 3.8)
+
+                        if now - self.hid.last_command_time >= 4.0:
+                            self.hid.send_command("W1")
+
+                    # Lock out all camera panning: dx = 0
+                    self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
+                    return
+
+            if self.nav_mode == "ALIGN":
+                if self.hid.is_walking:
+                    self.hid.stop_walk()
+
+                if abs(target_bearing_deg) <= 14.0:
+                    print(f"[NAV] Aligned with radar target ({target_bearing_deg:.1f} deg <= 14 deg) -> CRUISE_LOCKED")
+                    if self.logger:
+                        self.logger.log_event("NAV", f"Mode ALIGN -> CRUISE_LOCKED (aligned with radar target {target_bearing_deg:.1f} deg <= 14 deg)")
+                    self.nav_mode = "CRUISE_LOCKED"
+                    self.cruise_source = "RADAR"
+                    if not self.vacuum_active:
+                        self.hid.start_walk()
+                    self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
+                    return
+
+                # One-Shot Calibrated Turning
+                if now >= self.next_turn_ready_time:
+                    cpd = float(self.config.get("counts_per_degree", self.counts_per_degree))
+                    raw_dx = int(target_bearing_deg * cpd)
+                    dx = max(-95, min(95, raw_dx))
+                    if dx != 0:
+                        self.hid.move_mouse(dx, 0)
+                        self.next_turn_ready_time = now + 0.14
+                        if self.logger:
+                            self.logger.log_event("NAV", f"One-shot calibrated turn: bearing={target_bearing_deg:.1f} deg -> M{dx},0 (cpd={cpd:.3f}, settle=0.14s)")
+                self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
+                return
+
+        # 6. Terminal Approach: Hybrid 3D Quest Tracking (Template Matching + Direct Diamond HSV & Dark Outline)
         centroid, marker_type, bbox, score, scan_mode = self.detector.track_quest_marker(
             frame, self.config, frame_idx, self.last_template_lock
         )
