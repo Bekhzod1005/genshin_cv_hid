@@ -154,9 +154,9 @@ class VisionDetector:
 
         hsv_mini = cv2.cvtColor(mini_roi, cv2.COLOR_BGR2HSV)
 
-        # Annulus mask: 18 <= r <= 58 to exclude central player arrow (r < 18) and outer rim (r > 58)
+        # Annulus mask: 18 <= r <= 66 to exclude central player arrow (r < 18) and outer rim (r > 66)
         local_annulus = np.zeros((2 * r, 2 * r), dtype=np.uint8)
-        cv2.circle(local_annulus, (r, r), 58, 255, -1)
+        cv2.circle(local_annulus, (r, r), 66, 255, -1)
         cv2.circle(local_annulus, (r, r), 18, 0, -1)
 
         # Isolated Gold Quest Diamond blip: H: 19..33, S: 175..255, V: 205..255
@@ -400,7 +400,7 @@ class VisionDetector:
         if expected_type == "GOLD":
             mask = cv2.inRange(core_hsv, np.array([16, 115, 165]), np.array([40, 255, 255]))
         elif expected_type == "BLUE":
-            mask = cv2.inRange(core_hsv, np.array([92, 55, 135]), np.array([124, 255, 255]))
+            mask = cv2.inRange(core_hsv, np.array([82, 25, 135]), np.array([126, 255, 255]))
         else:
             return False
 
@@ -425,7 +425,7 @@ class VisionDetector:
         return blue_ratio >= 0.45
 
     def _has_dark_outline(self, roi_val: np.ndarray, c: np.ndarray, bx: int, by: int, bw: int, bh: int) -> bool:
-        """Verify >= 15% of pixels in the 2-3px dilated outline ring have V < 140."""
+        """Verify >= 35% of pixels in the 2-3px dilated outline ring have V < 125."""
         h, w = roi_val.shape[:2]
         px1 = max(0, bx - 4)
         py1 = max(0, by - 4)
@@ -449,8 +449,8 @@ class VisionDetector:
         if ring_pixels.size == 0:
             return False
 
-        dark_count = int(np.count_nonzero(ring_pixels < 140))
-        return (float(dark_count) / float(ring_pixels.size)) >= 0.15
+        dark_count = int(np.count_nonzero(ring_pixels < 125))
+        return (float(dark_count) / float(ring_pixels.size)) >= 0.35
 
     def detect_direct_diamonds(
         self,
@@ -465,7 +465,9 @@ class VisionDetector:
         Direct Diamond HSV + Dark-Outline Detector:
         - Gold Core: H: 17..38, S: 135..255, V: 185..255, bounding box 8 <= w, h <= 28, aspect 0.72..1.38.
         - Blue Core: H: 90..122, S: 60..255, V: 145..255 with cyan center (V >= 210) and not surrounded by sky/water (< 45% blue in 44x44 outer ring).
-        - Immediate 2-3 px dark outline check: >= 15% of dilated outline ring pixels have V < 140.
+        - Shape Solidity: 0.38 <= contourArea / (bw * bh) <= 0.68 (rhombus silhouette).
+        - Outline Contrast: >= 35% of dilated outline ring pixels have V < 125.
+        - Direct diamond scores are capped at 0.58.
         """
         val_roi = hsv_roi[:, :, 2]
         candidates = []
@@ -482,6 +484,10 @@ class VisionDetector:
             if 8 <= bw <= 28 and 8 <= bh <= 28:
                 aspect = float(bw) / float(bh)
                 if 0.72 <= aspect <= 1.38:
+                    area = cv2.contourArea(c)
+                    extent = float(area) / float(bw * bh) if bw * bh > 0 else 0.0
+                    if not (0.38 <= extent <= 0.68):
+                        continue
                     tcx = x_offset + bx + bw // 2
                     tcy = y_offset + by + bh // 2
                     # Central stamina exclusion zone check
@@ -490,7 +496,7 @@ class VisionDetector:
                     if self._has_dark_outline(val_roi, c, bx, by, bw, bh):
                         candidates.append({
                             "type": "GOLD",
-                            "score": 0.88,
+                            "score": 0.58,
                             "centroid": (tcx, tcy),
                             "bbox": (x_offset + bx, y_offset + by, bw, bh),
                             "scan_mode": "Direct Diamond: Gold",
@@ -504,6 +510,10 @@ class VisionDetector:
                 if 8 <= bw <= 28 and 8 <= bh <= 28:
                     aspect = float(bw) / float(bh)
                     if 0.72 <= aspect <= 1.38:
+                        area = cv2.contourArea(c)
+                        extent = float(area) / float(bw * bh) if bw * bh > 0 else 0.0
+                        if not (0.38 <= extent <= 0.68):
+                            continue
                         tcx = x_offset + bx + bw // 2
                         tcy = y_offset + by + bh // 2
                         if 520 <= tcx <= 760 and 240 <= tcy <= 540:
@@ -522,7 +532,7 @@ class VisionDetector:
                         if self._has_dark_outline(val_roi, c, bx, by, bw, bh):
                             candidates.append({
                                 "type": "BLUE",
-                                "score": 0.82,
+                                "score": 0.56,
                                 "centroid": (tcx, tcy),
                                 "bbox": (x_offset + bx, y_offset + by, bw, bh),
                                 "scan_mode": "Direct Diamond: Blue",
@@ -600,24 +610,14 @@ class VisionDetector:
             return None, None, None, 0.0, "None"
 
         # ----------------------------------------------------------------------
-        # CANDIDATE COLLECTION: DIRECT DIAMOND + TEMPLATE MATCHING
+        # CANDIDATE COLLECTION: TEMPLATE MATCHING WITH DIRECT DIAMOND FALLBACK
         # ----------------------------------------------------------------------
         candidates: List[Dict[str, Any]] = []
 
-        # 1. Direct Diamond HSV + Dark-Outline Detector
-        direct_diamonds = self.detect_direct_diamonds(
-            roi_bgr=roi,
-            hsv_roi=hsv_roi,
-            x_offset=x1,
-            y_offset=y1,
-            blue_enabled=blue_enabled,
-            frame_bgr=frame_bgr,
-        )
-        candidates.extend(direct_diamonds)
-
-        # 2. Multi-Scale Template Matching Scan (scales: 0.85, 1.0, 1.15)
-        # Gold Template Scan
+        # 1. Multi-Scale Template Matching Scan (scales: 0.85, 1.0, 1.15)
+        # Gold Template Scan - Evaluate all scales and keep highest-scoring match
         if self.quest_gold_template_gray is not None:
+            best_gold_cand: Optional[Dict[str, Any]] = None
             for scale in (0.85, 1.0, 1.15):
                 tw = int(self.quest_gold_template_gray.shape[1] * scale)
                 th = int(self.quest_gold_template_gray.shape[0] * scale)
@@ -633,17 +633,20 @@ class VisionDetector:
                     tcy = y1 + ty + th // 2
                     patch = roi[ty : ty + th, tx : tx + tw]
                     if self._verify_template_hue(patch, "GOLD"):
-                        candidates.append({
-                            "type": "GOLD",
-                            "score": float(max_val),
-                            "centroid": (tcx, tcy),
-                            "bbox": (x1 + tx, y1 + ty, tw, th),
-                            "scan_mode": "Template: Gold",
-                        })
-                        break
+                        if best_gold_cand is None or max_val > best_gold_cand["score"]:
+                            best_gold_cand = {
+                                "type": "GOLD",
+                                "score": float(max_val),
+                                "centroid": (tcx, tcy),
+                                "bbox": (x1 + tx, y1 + ty, tw, th),
+                                "scan_mode": f"Template: Gold ({scale:.2f}x)",
+                            }
+            if best_gold_cand is not None:
+                candidates.append(best_gold_cand)
 
-        # Blue Template Scan
+        # Blue Template Scan - Evaluate all scales and keep highest-scoring match
         if blue_enabled and self.quest_blue_template_gray is not None:
+            best_blue_cand: Optional[Dict[str, Any]] = None
             for scale in (0.85, 1.0, 1.15):
                 tw = int(self.quest_blue_template_gray.shape[1] * scale)
                 th = int(self.quest_blue_template_gray.shape[0] * scale)
@@ -659,17 +662,32 @@ class VisionDetector:
                     tcy = y1 + ty + th // 2
                     patch = roi[ty : ty + th, tx : tx + tw]
                     if self._verify_template_hue(patch, "BLUE") and not self._is_sky_or_water_background(frame_bgr, tcx, tcy):
-                        candidates.append({
-                            "type": "BLUE",
-                            "score": float(max_val),
-                            "centroid": (tcx, tcy),
-                            "bbox": (x1 + tx, y1 + ty, tw, th),
-                            "scan_mode": "Template: Blue",
-                        })
-                        break
+                        if best_blue_cand is None or max_val > best_blue_cand["score"]:
+                            best_blue_cand = {
+                                "type": "BLUE",
+                                "score": float(max_val),
+                                "centroid": (tcx, tcy),
+                                "bbox": (x1 + tx, y1 + ty, tw, th),
+                                "scan_mode": f"Template: Blue ({scale:.2f}x)",
+                            }
+            if best_blue_cand is not None:
+                candidates.append(best_blue_cand)
+
+        # 2. Direct Diamond HSV + Dark-Outline Detector (Fallback only if zero template candidates)
+        if not candidates:
+            direct_diamonds = self.detect_direct_diamonds(
+                roi_bgr=roi,
+                hsv_roi=hsv_roi,
+                x_offset=x1,
+                y_offset=y1,
+                blue_enabled=blue_enabled,
+                frame_bgr=frame_bgr,
+            )
+            candidates.extend(direct_diamonds)
 
         if candidates:
-            candidates.sort(key=lambda item: (1 if item["type"] == "GOLD" else 0, item["score"]), reverse=True)
+            # Sort strictly by score descending (no Gold-over-Blue override)
+            candidates.sort(key=lambda item: item["score"], reverse=True)
             best = candidates[0]
             return best["centroid"], best["type"], best["bbox"], best["score"], best["scan_mode"]
 

@@ -42,6 +42,7 @@ class AssistantStateMachine:
 
         # Marker Tracking & Locked Target Info
         self.marker_last_seen_time = time.time()
+        self.last_valid_marker_x: Optional[int] = None
         self.active_marker_type: Optional[str] = None
         self.active_marker_centroid: Optional[Tuple[int, int]] = None
         self.active_marker_bbox: Optional[Tuple[int, int, int, int]] = None
@@ -123,6 +124,7 @@ class AssistantStateMachine:
         self.bow_substate: str = "AIM_IDLE"  # AIM_SWAP_WAIT, AIM_ENTER_R, AIM_TRACK_AND_CHARGE, AIM_RELEASE
         self.bow_substate_ready_time: float = 0.0
         self.bow_charge_start_time: float = 0.0
+        self.last_aim_mouse_time: float = 0.0
 
     def update_config(self, new_config: Dict[str, Any]):
         """Update active configuration parameters dynamically."""
@@ -395,15 +397,17 @@ class AssistantStateMachine:
                 self.active_combat_action_label = "Amber: Aim Mode [R] Charging Shot"
                 return
 
-            # While in Aim Mode: Active 2-Axis Tracking & Charging
+            # While in Aim Mode: Active 2-Axis Tracking & Charging (rate-limited to 28 Hz / 0.035s)
             if self.bow_substate == "AIM_TRACK_AND_CHARGE":
                 if self.combat_target_centroid is not None:
-                    ecx, ecy = self.combat_target_centroid
-                    aim_err_x = ecx - 640
-                    aim_err_y = (ecy + 35) - 360
-                    dx = max(-40, min(40, int(aim_err_x * 0.22)))
-                    dy = max(-40, min(40, int(aim_err_y * 0.22)))
-                    self.hid.move_mouse(dx, dy)
+                    if now - self.last_aim_mouse_time >= 0.035:
+                        ecx, ecy = self.combat_target_centroid
+                        aim_err_x = ecx - 640
+                        aim_err_y = (ecy + 35) - 360
+                        dx = max(-40, min(40, int(aim_err_x * 0.22)))
+                        dy = max(-40, min(40, int(aim_err_y * 0.22)))
+                        self.hid.move_mouse(dx, dy)
+                        self.last_aim_mouse_time = now
 
                 charge_elapsed = now - self.bow_charge_start_time
                 self.active_combat_action_label = f"Amber: Charging Shot ({charge_elapsed:.1f}s/1.6s) [{self.bow_aim_shot_count + 1}/3]"
@@ -516,13 +520,9 @@ class AssistantStateMachine:
                     return
 
                 # Situation B: Quest Target Arrival
-                # 3D Marker locked (or locked within last 1.5s) near center (|error_x| <= 95 px)
-                marker_recent = (now - self.marker_last_seen_time <= 1.5)
-                marker_centered = False
-                if self.active_marker_centroid is not None:
-                    marker_centered = (abs(self.active_marker_centroid[0] - 640) <= 95)
-                elif self.last_template_lock is not None and self.last_template_lock.get("centroid") is not None:
-                    marker_centered = (abs(self.last_template_lock["centroid"][0] - 640) <= 95)
+                # 3D Marker locked (or locked within last 3.5s) near center (|error_x| <= 135 px)
+                marker_recent = (now - self.marker_last_seen_time <= 3.5)
+                marker_centered = (self.last_valid_marker_x is not None and abs(self.last_valid_marker_x - 640) <= 135)
 
                 if marker_recent and marker_centered:
                     print("[NAV] Arrived at quest target with [F] prompt -> single F tap.")
@@ -583,6 +583,7 @@ class AssistantStateMachine:
 
         if centroid is not None:
             self.marker_last_seen_time = now
+            self.last_valid_marker_x = centroid[0]
             self.is_scanning_for_marker = False
             self.lost_marker_phase = "IDLE"
             self.lost_marker_start_time = 0.0
@@ -640,19 +641,35 @@ class AssistantStateMachine:
             # INSTANT DIRECTIONAL TURNING VIA MINIMAP QUEST BEARING
             # ------------------------------------------------------------------
             if quest_bearing is not None:
-                self.marker_last_seen_time = now
+                # Do NOT overwrite self.marker_last_seen_time = now (keep strictly for 3D locks)
                 self.is_scanning_for_marker = False
                 self.lost_marker_phase = "IDLE"
                 self.lost_marker_start_time = 0.0
                 self.lost_marker_step_count = 0
 
+                # Check 'V' pulse for occluded 3D marker every 5.0s
+                time_lost = now - self.marker_last_seen_time
+                v_delay = float(self.config.get("lost_marker_v_delay", 0.8))
+                v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
+                if time_lost > v_delay and (now - self.last_quest_v_pulse_time >= v_cooldown):
+                    self.hid.press_v()
+                    self.last_quest_v_pulse_time = now
+                    print(f"[NAV] Quest marker occluded ({time_lost:.2f}s > {v_delay}s): dispatched 'V' pulse.")
+
                 # Calculate instant pivot towards off-screen bearing
                 pivot_dx, should_pause_walk = self.steering.compute_minimap_pivot(quest_bearing, now)
-                if should_pause_walk and self.hid.is_walking:
-                    self.hid.stop_walk()
-
                 if pivot_dx != 0:
                     self.hid.move_mouse(pivot_dx, 0)
+
+                if should_pause_walk:
+                    if self.hid.is_walking:
+                        self.hid.stop_walk()
+                else:
+                    if not self.hid.is_walking and not self.vacuum_active:
+                        self.hid.start_walk()
+                    if self.hid.is_walking:
+                        if now - self.hid.last_command_time >= 4.0:
+                            self.hid.send_command("W1")
                 return
 
             # ------------------------------------------------------------------

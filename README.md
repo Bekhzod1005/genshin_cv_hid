@@ -36,33 +36,35 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
 
 ## v5.1 Architecture & Runtime Regression Overhaul
 
-1. **Robust 3D Quest Marker Locking (Hybrid Template + Direct Diamond Detection):**
+1. **Robust 3D Quest Marker Locking (Hybrid Template + Direct Diamond Fallback):**
    - **Deleted Broken Border Contrast Check:** Removed the fragile $V_{core} - V_{border} \ge 25$ outer-border subtraction check that failed in bright daytime Mondstadt overworld conditions where sky, grass, and clouds have $V \ge 210$.
-   - **Inner $18 \times 18$ Cropping:** Loaded templates (`assets/quest_gold.png` and `assets/quest_blue.png`) are automatically center-cropped to $18 \times 18$ at runtime, stripping away static outer background corners while keeping on-disk PNGs untouched.
-   - **Direct Diamond HSV + Dark Outline Detector:** Runs in parallel with template matching ($\ge 0.50$):
-     - **Gold Core:** `H: 17..38, S: 135..255, V: 185..255`, bounding box $8 \le w, h \le 28$, aspect $0.72..1.38$.
-     - **Blue Core:** `H: 90..122, S: 60..255, V: 145..255` with cyan center ($V \ge 210$) and sky/water rejection ($< 45\%$ blue in $44 \times 44$ outer ring).
-     - **Dark Outline Verification:** Verifies that $\ge 15\%$ of pixels in a $2\text{--}3$ px dilated outline ring have $V < 140$, rejecting flat terrain and foliage.
+   - **Inner $18 \times 18$ Cropping & Scale Evaluation:** Loaded templates (`assets/quest_gold.png` and `assets/quest_blue.png`) are automatically center-cropped to $18 \times 18$ at runtime, stripping away static outer background corners. All three scales (`0.85`, `1.0`, `1.15`) are fully evaluated to keep the highest-scoring candidate.
+   - **Widened Blue Core Hue:** Widened the `BLUE` inner core HSV range to `[82, 25, 135]..[126, 255, 255]` so the glowing cyan-white center ($H \sim 86\text{--}95, S \sim 30\text{--}70, V > 210$) is reliably accepted.
+   - **Score-Based Arbitration (No Gold-Over-Blue Bias):** Candidates are sorted strictly by `item["score"]` descending, preventing warm terrain or yellow flora from overriding authentic Blue World Quest template matches.
+   - **Solidity-Filtered Direct Diamond Fallback:** Direct diamond detection is invoked only as a fallback when template matching yields zero candidates above threshold:
+     - **Shape Solidity Extent:** Requires $0.38 \le \text{contourArea} / (bw \times bh) \le 0.68$, enforcing a true $45^\circ$ rhombus silhouette and rejecting solid rectangular or rounded flora.
+     - **Dark Outline Verification:** Verifies that $\ge 35\%$ of pixels in a $2\text{--}3$ px dilated outline ring have $V < 125$.
+     - Scores are capped at `0.58`.
      - Central stamina arc exclusion zone ($x: 520..760, y: 240..540$) is strictly masked out.
 2. **Eliminated Idle Left Rotation & Minimap False Positives:**
-   - **Annulus Mask & Pure Gold Minimap Blips:** Removed Blue blips completely from minimap analysis to eliminate water/waypoint/player-arrow false positives. Evaluates only the $18 \le r \le 58$ annulus, rejecting the central player arrow ($r < 18$) and outer UI border ($r > 58$). Only reports `quest_bearing` for isolated Gold minimap diamonds (`H: 19..33, S: 175..255, V: 205..255`, area $10..65$ px, $w, h \le 12$).
+   - **Annulus Mask & Pure Gold Minimap Blips:** Evaluates the expanded $18 \le r \le 66$ annulus, capturing edge-pinned blips while rejecting the central player arrow ($r < 18$). Excludes Blue blips from minimap to avoid river/waypoint spin.
+   - **Off-Screen Minimap Walking & Occlusion V-Pulse:** When tracking minimap bearings, forward walking (`W1`) is engaged and sustained with 4.0s keepalive once aligned. `marker_last_seen_time` is preserved so `V` navigation pulses continue firing every $5.0$s when the 3D diamond is occluded behind terrain.
    - **4-Phase Non-Endless Lost-Marker Recovery:**
      - **Phase 1 (Wait Initial):** Immediately halts forward walk (`W0`) and stops camera movement (`dx = 0`) for $0.8$s.
      - **Phase 2 (Pulse V):** Pulses `V` once ($5.0$s cooldown) and waits $1.0$s completely stationary (`dx = 0, W0`) for the trail or marker to appear.
      - **Phase 3 (Discrete Step Sweep):** Executes at most 8 discrete step turns (`M32,0` every $0.28$s, pausing between steps).
      - **Phase 4 (Sweep Complete):** Halts camera rotation completely (`dx = 0, W0`) and remains idle until a marker appears or the $5.0$s `V` pulse cooldown expires. Never spins endlessly.
-3. **Context-Aware `[F]` Prompt Arbitration (Prevent Random NPC Dialogue):**
-   - In `NAVIGATE`, arbitrary overworld `[F]` prompts (NPCs, cooking pots, signposts) no longer trigger loot vacuums or keypresses.
-   - Interacts with `[F]` in only two verified situations:
-     - **Quest Target Arrival:** 3D marker is locked (or locked within last $1.5$s) near center ($|error\_x| \le 95$ px) AND `[F]` prompt appears $\rightarrow$ single `F` tap ($1.2$s cooldown, not vacuum).
-     - **Post-Combat / Sealed Chest Loot:** Only triggers `start_loot_vacuum()` when approaching a confirmed sealed chest in `STATE_CHEST_LOOT` OR within $4.0$s after exiting `STATE_COMBAT_AUTO` (monster drops).
+3. **Context-Aware `[F]` Prompt Arbitration & NPC Interaction:**
+   - **Preserved Last Valid Marker Position:** Tracks `last_valid_marker_x` so that when Genshin hides the 3D marker as the player steps within NPC interaction range, arrival is reliably detected (`now - marker_last_seen_time <= 3.5` and $|last\_valid\_marker\_x - 640| \le 135$) to trigger a single `F` tap ($1.2$s cooldown).
+   - In `NAVIGATE`, arbitrary overworld `[F]` prompts (cooking pots, signposts) no longer trigger dialogue or loot vacuums.
+   - Only triggers `start_loot_vacuum()` when approaching a confirmed sealed chest in `STATE_CHEST_LOOT` OR within $4.0$s after exiting `STATE_COMBAT_AUTO` (monster drops).
 4. **Staged Non-Blocking Obstacle Unstuck State Machine:**
    - Replaced permanent stall lockout with a staged, non-blocking unstuck routine:
      - **Stage 1 (Stall $\ge 0.8$s):** Pulses `SPACE` jump without stopping forward walking.
      - **Stage 2 (Stall $\ge 1.7$s):** Halts walking (`W0`), pivots laterally $\pm 70$ counts, resumes forward walking (`W1`), and jumps (`SPACE`), resetting the stall timer.
-5. **Non-Blocking Combat & Amber Aiming Sub-States:**
+5. **Non-Blocking Combat & Amber Aiming Sub-States (28 Hz Rate-Limited):**
    - Replaced all blocking `time.sleep()` calls in combat with non-blocking timestamp sub-states (`AIM_SWAP_WAIT`, `AIM_ENTER_R`, `AIM_TRACK_AND_CHARGE`, `AIM_RELEASE`).
-   - Actively tracks the enemy's moving HP bar with 2-axis mouse steering (`M<dx>,<dy>`) *while* `LMB_HOLD` charges Amber's shot.
+   - Actively tracks the enemy's moving HP bar with 2-axis mouse steering (`M<dx>,<dy>`) *while* `LMB_HOLD` charges Amber's shot, rate-limited to **28 Hz** (`0.035s`) to prevent serial buffer saturation.
 6. **Two-Zone PD Camera Steering & Pivot-in-Place:**
    - Firmware micro-stepped mouse movement widened to `[-110, 110]` with $16$-count steps spaced $900\,\mu$s apart.
    - Python PD controller operates at **28 Hz** ($0.035$s update interval) without pre-PD EMA lag:
