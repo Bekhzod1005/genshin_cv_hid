@@ -41,14 +41,14 @@ const size_t CMD_BUF_SIZE = 64;
 char cmdBuffer[CMD_BUF_SIZE];
 size_t cmdIndex = 0;
 
-// Safety watchdog: auto-release keys if no command is received for 8 seconds while keys/buttons are held
+// Safety watchdog: auto-release keys if no command is received for 15 seconds while keys/buttons are held
 unsigned long lastCommandTime = 0;
 bool isKeyHeld = false;
-const unsigned long WATCHDOG_TIMEOUT_MS = 8000;
+const unsigned long WATCHDOG_TIMEOUT_MS = 15000;
 
 void setup() {
-  // Seed random generator for natural human-like input variance
-  randomSeed(analogRead(0));
+  // Seed random generator with ESP32-S3 hardware true RNG
+  randomSeed(esp_random());
 
   // Initialize native USB and HID peripherals
   Serial.begin(115200);

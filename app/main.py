@@ -149,6 +149,7 @@ class ESP32HIDController:
         self.is_walking: bool = False
         self.walk_start_time: float = 0.0
         self.is_lmb_held: bool = False
+        self.last_command_time: float = time.time()
         self.lock = threading.Lock()
 
         if not self.dry_run:
@@ -174,6 +175,7 @@ class ESP32HIDController:
 
     def send_command(self, cmd: str):
         """Send a newline-terminated command string to the microcontroller."""
+        self.last_command_time = time.time()
         if self.dry_run:
             return
         with self.lock:
@@ -904,6 +906,10 @@ class GenshinAssistant:
                     self.hid.click_rmb()
                     self.last_sprint_time = now
                     self.next_sprint_interval = random.uniform(2.1, 3.8)
+
+                # Lightweight keepalive: re-send W1 every 4.0s if no other command was sent in that window
+                if self.hid.is_walking and (now - self.hid.last_command_time >= 4.0):
+                    self.hid.send_command("W1")
 
         else:
             # Gold quest marker not visible in central ROI
