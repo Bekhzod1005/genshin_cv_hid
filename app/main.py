@@ -72,6 +72,7 @@ ROI_NAV = (100, 540, 190, 1090)        # Central Gold Quest Marker Tracking Area
 ROI_CHOICE = (320, 560, 700, 1090)     # Middle-Right Dialogue Option Area
 ROI_GROUND = (500, 680, 440, 840)      # Lower-Center Ground Motion Differencing
 ROI_COMBAT = (36, 360, 100, 1180)      # Upper/Middle Enemy Health Bar Area
+ROI_INTERACT = (300, 490, 740, 940)    # Overworld [F] Prompt Area
 
 # State Definitions
 STATE_NAVIGATE = "NAVIGATE"
@@ -99,6 +100,18 @@ def human_delay(
     if allow_micro_pause and random.random() < 0.10:
         clamped += random.uniform(0.85, 1.55)
     return clamped
+
+
+def dialogue_advance_delay() -> float:
+    """
+    Generate natural humanized dialogue advance delays (0.38s - 0.78s),
+    with a 12% probability of a 0.95s - 1.45s pause.
+    """
+    val = random.lognormvariate(math.log(0.52), 0.22)
+    delay = max(0.38, min(0.78, val))
+    if random.random() < 0.12:
+        delay += random.uniform(0.95, 1.45)
+    return delay
 
 
 # ==============================================================================
@@ -293,7 +306,7 @@ DEFAULT_CONFIG = {
     "S_max": 255,
     "V_min": 180,
     "V_max": 255,
-    "Kp_x100": 15,
+    "Kp_x100": 14,
 }
 
 
@@ -339,7 +352,7 @@ def setup_tuner_window(initial_cfg: Dict[str, int]):
     cv2.createTrackbar("S_max", TUNER_WINDOW, initial_cfg["S_max"], 255, nothing)
     cv2.createTrackbar("V_min", TUNER_WINDOW, initial_cfg["V_min"], 255, nothing)
     cv2.createTrackbar("V_max", TUNER_WINDOW, initial_cfg["V_max"], 255, nothing)
-    cv2.createTrackbar("Kp_x100", TUNER_WINDOW, initial_cfg["Kp_x100"], 100, nothing)
+    cv2.createTrackbar("Kp_x100", TUNER_WINDOW, min(initial_cfg["Kp_x100"], 40), 40, nothing)
 
 
 def read_tuner_values() -> Dict[str, int]:
@@ -470,6 +483,47 @@ class VisionDetector:
 
         return False, None
 
+    def detect_overworld_f_prompt(
+        self, frame_bgr: np.ndarray
+    ) -> Tuple[bool, Optional[Tuple[int, int, int, int]]]:
+        """
+        Detect overworld [F] interaction keycap in y: 300..490, x: 740..940.
+        Genshin's [F] prompt is a high-contrast near-square icon (w, h: 18..42px)
+        with the dark letter 'F' inside a bright white/light-gray rounded keycap.
+        """
+        y1, y2, x1, x2 = ROI_INTERACT
+        roi = frame_bgr[y1:y2, x1:x2]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+        # Adaptive thresholding to isolate crisp keycap edges regardless of outdoor lighting
+        thresh = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
+
+        # High brightness mask: keycap body is bright white/light-gray (V >= 195)
+        _, bright_mask = cv2.threshold(gray, 195, 255, cv2.THRESH_BINARY)
+        combined = cv2.bitwise_and(thresh, bright_mask)
+
+        # Find external contours of keycap candidates
+        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if 18 <= bw <= 42 and 18 <= bh <= 42:
+                aspect_ratio = float(bw) / float(bh)
+                if 0.75 <= aspect_ratio <= 1.35:
+                    # Interior contrast check: ensure high interior edge contrast
+                    # (letter 'F' inside keycap) so flat bright sky or clouds are rejected
+                    patch = gray[by : by + bh, bx : bx + bw]
+                    if patch.size > 0:
+                        edges = cv2.Canny(patch, 60, 160)
+                        edge_count = cv2.countNonZero(edges)
+                        std_dev = float(np.std(patch))
+                        # Keycaps with dark glyph 'F' have high variance (std > 20) and interior edges (>= 10)
+                        if edge_count >= 10 and std_dev >= 20.0:
+                            return True, (x1 + bx, y1 + by, bw, bh)
+
+        return False, None
+
     def detect_combat_red_hp_bars(
         self, frame_bgr: np.ndarray
     ) -> Tuple[bool, int, float, Optional[Tuple[int, int]]]:
@@ -592,6 +646,21 @@ class GenshinAssistant:
         self.last_sprint_time = time.time()
         self.next_sprint_interval = random.uniform(2.1, 3.8)
         self.pending_v_pulse_time: Optional[float] = None
+        self.scan_sweep_direction: int = 1
+        self.last_scan_sweep_time: float = 0.0
+        self.next_scan_sweep_interval: float = 0.22
+        self.is_scanning_for_marker: bool = False
+
+        # Overworld [F] Prompt Interaction
+        self.f_prompt_consecutive_frames: int = 0
+        self.f_prompt_box: Optional[Tuple[int, int, int, int]] = None
+        self.last_overworld_f_time: float = 0.0
+        self.overworld_f_cooldown: float = 1.6
+        self.pending_overworld_f_press_time: Optional[float] = None
+        self.show_overworld_f_box_until: float = 0.0
+
+        # Fast Humanized Dialogue Skipping
+        self.next_dialogue_f_time: float = 0.0
 
         # Stuck detection
         self.prev_ground_gray: Optional[np.ndarray] = None
@@ -627,6 +696,9 @@ class GenshinAssistant:
                     self.hid.stop_all()
                     self.combat_queue.clear()
                     self.is_closing_distance = False
+                    self.f_prompt_consecutive_frames = 0
+                    self.pending_overworld_f_press_time = None
+                    self.is_scanning_for_marker = False
 
         listener = keyboard.Listener(on_press=on_press)
         listener.daemon = True
@@ -651,7 +723,8 @@ class GenshinAssistant:
         print("   [Q]   : Clean Shutdown & Emergency Key Release")
         print("=" * 68 + "\n")
 
-        with mss.mss() as sct:
+        mss_factory = getattr(mss, "MSS", mss.mss)
+        with mss_factory() as sct:
             try:
                 while True:
                     loop_start = time.time()
@@ -817,35 +890,31 @@ class GenshinAssistant:
                 print(f"[STATE] Entered {STATE_DIALOGUE} (Minimap hidden, metric: {minimap_score:.3f})")
                 self.hid.stop_all()
                 self.combat_queue.clear()
+                self.f_prompt_consecutive_frames = 0
+                self.pending_overworld_f_press_time = None
+                self.next_dialogue_f_time = now + dialogue_advance_delay()
 
             # Check for dialogue speech bubble / choice icon
             choice_detected, choice_box = self.detector.check_choice_icon(frame)
-            if choice_detected:
-                if choice_box:
-                    bx, by, bw, bh = choice_box
-                    cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
-                    cv2.putText(
-                        debug_frame,
-                        "CHOICE ICON",
-                        (bx, by - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45,
-                        (0, 255, 0),
-                        1,
-                    )
+            if choice_detected and choice_box:
+                bx, by, bw, bh = choice_box
+                cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
+                cv2.putText(
+                    debug_frame,
+                    "CHOICE ICON",
+                    (bx, by - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (0, 255, 0),
+                    1,
+                )
 
-                # Log-normal human reaction delay + 2.0s cooldown
-                if now - self.last_choice_f_time >= 2.0:
-                    if self.pending_f_press_time is None:
-                        # Humanized delay using helper
-                        reaction_delay = human_delay(mean=0.35, sigma=0.30, min_val=0.22, max_val=0.75, allow_micro_pause=False)
-                        self.pending_f_press_time = now + reaction_delay
-
-                if self.pending_f_press_time and now >= self.pending_f_press_time:
-                    print("[DIALOGUE] Option selected: dispatching 'F' keypress.")
-                    self.hid.press_f()
-                    self.last_choice_f_time = now
-                    self.pending_f_press_time = None
+            # Faster Humanized Dialogue Skipping:
+            # Advance both regular dialogue lines and choice boxes at log-normal cadence
+            # (0.38s - 0.78s + 12% chance of 0.95s - 1.45s pause) with NO sluggish 2.0s cooldown
+            if now >= self.next_dialogue_f_time:
+                self.hid.press_f()
+                self.next_dialogue_f_time = now + dialogue_advance_delay()
 
             self.previous_minimap_state = False
             return
@@ -866,16 +935,40 @@ class GenshinAssistant:
             self.hid.press_v()
             self.pending_v_pulse_time = None
 
-        # 1. Ground motion calculation (stuck detection)
+        # 1. Overworld [F] Prompt Detection (Statues of the Seven, Waypoints, Items, Doors, NPCs)
+        f_prompt_detected, prompt_box = self.detector.detect_overworld_f_prompt(frame)
+        if f_prompt_detected and prompt_box:
+            self.f_prompt_consecutive_frames += 1
+            self.f_prompt_box = prompt_box
+            if self.f_prompt_consecutive_frames >= 2:
+                self.show_overworld_f_box_until = now + 1.2
+                if (now - self.last_overworld_f_time >= self.overworld_f_cooldown) and (self.pending_overworld_f_press_time is None):
+                    # Stop walking past the object
+                    if self.hid.is_walking:
+                        self.hid.stop_walk()
+                    self.pending_overworld_f_press_time = now + random.uniform(0.15, 0.28)
+        else:
+            self.f_prompt_consecutive_frames = 0
+
+        # Dispatch pending overworld [F] interaction after reaction delay
+        if self.pending_overworld_f_press_time is not None and now >= self.pending_overworld_f_press_time:
+            print("[OVERWORLD] [F] Prompt confirmed: interacting.")
+            self.hid.press_f()
+            self.last_overworld_f_time = now
+            self.overworld_f_cooldown = random.uniform(1.4, 2.1)
+            self.pending_overworld_f_press_time = None
+
+        # 2. Ground motion calculation (stuck detection)
         raw_motion, self.prev_ground_gray = self.detector.calculate_ground_motion(frame, self.prev_ground_gray)
         self.smooth_motion_score = 0.75 * self.smooth_motion_score + 0.25 * raw_motion
 
-        # 2. Track Gold Quest Marker
+        # 3. Track Gold Quest Marker
         centroid, _ = self.detector.track_gold_quest_marker(frame, self.config)
 
         if centroid is not None:
             self.marker_last_seen_time = now
             self.is_stuck_alert = False
+            self.is_scanning_for_marker = False
             cx, cy = centroid
 
             # Draw centroid and crosshair
@@ -887,60 +980,83 @@ class GenshinAssistant:
             error_x = cx - 640
             cv2.arrowedLine(debug_frame, (640, cy), (cx, cy), (0, 255, 255), 2, tipLength=0.2)
 
-            # Humanized Noisy Camera Steering with 38px Deadzone
+            # Remember sweep direction based on current marker error
+            if error_x > 20:
+                self.scan_sweep_direction = 1
+            elif error_x < -20:
+                self.scan_sweep_direction = -1
+
+            # Humanized Noisy Camera Steering with 22px Deadzone
             self._apply_humanized_steering(error_x, now)
 
-            # Check if stuck against obstacle/wall while walking forward
-            walk_time = now - self.hid.walk_start_time if self.hid.is_walking else 0.0
-            if self.hid.is_walking and walk_time > 2.5 and self.smooth_motion_score < 1.05:
-                # Character is stuck against rock / tree / cliff
-                self.hid.stop_all()
-                self.is_stuck_alert = True
-                play_alert_chime(880, 220)
-                print(f"[STUCK] Low ground motion ({self.smooth_motion_score:.2f}) while walking. STOP sent!")
-            elif not self.is_stuck_alert:
-                self.hid.start_walk()
+            # Hard Turn Check: if abs(error_x) > 160 px, pause walking while turning camera hard
+            is_hard_turning = abs(error_x) > 160
+            if is_hard_turning:
+                if self.hid.is_walking:
+                    self.hid.stop_walk()
+            else:
+                # Normal forward navigation
+                walk_time = now - self.hid.walk_start_time if self.hid.is_walking else 0.0
+                if self.hid.is_walking and walk_time > 2.5 and self.smooth_motion_score < 1.05:
+                    # Character is stuck against rock / tree / cliff
+                    self.hid.stop_all()
+                    self.is_stuck_alert = True
+                    play_alert_chime(880, 220)
+                    print(f"[STUCK] Low ground motion ({self.smooth_motion_score:.2f}) while walking. STOP sent!")
+                elif not self.is_stuck_alert and (self.pending_overworld_f_press_time is None):
+                    self.hid.start_walk()
 
-                # Variable Sprint Cadence: Trigger RMB dash at randomized intervals (2.1 - 3.8s)
-                if now - self.last_sprint_time >= self.next_sprint_interval:
-                    self.hid.click_rmb()
-                    self.last_sprint_time = now
-                    self.next_sprint_interval = random.uniform(2.1, 3.8)
+                    # Variable Sprint Cadence: Trigger RMB dash at randomized intervals (2.1 - 3.8s)
+                    if now - self.last_sprint_time >= self.next_sprint_interval:
+                        self.hid.click_rmb()
+                        self.last_sprint_time = now
+                        self.next_sprint_interval = random.uniform(2.1, 3.8)
 
-                # Lightweight keepalive: re-send W1 every 4.0s if no other command was sent in that window
-                if self.hid.is_walking and (now - self.hid.last_command_time >= 4.0):
-                    self.hid.send_command("W1")
+                    # Lightweight keepalive: re-send W1 every 4.0s if no other command was sent in that window
+                    if self.hid.is_walking and (now - self.hid.last_command_time >= 4.0):
+                        self.hid.send_command("W1")
 
         else:
             # Gold quest marker not visible in central ROI
             time_lost = now - self.marker_last_seen_time
-            if self.hid.is_walking and time_lost > 1.2:
-                self.hid.stop_all()
-                play_alert_chime(880, 220)
-                print(f"[NAV] Quest marker lost for {time_lost:.1f}s. STOP sent for safety.")
+            if time_lost > 1.2:
+                # Stop walking forward blindly
+                if self.hid.is_walking:
+                    self.hid.stop_walk()
+
+                self.is_scanning_for_marker = True
+
+                # Lost-Marker Camera Scan:
+                # Perform humanized slow horizontal camera sweep (22-36 px bursts every 0.18s-0.32s)
+                if now - self.last_scan_sweep_time >= self.next_scan_sweep_interval:
+                    burst_dx = random.randint(22, 36) * self.scan_sweep_direction
+                    self.hid.move_mouse(burst_dx)
+                    self.last_scan_sweep_time = now
+                    self.next_scan_sweep_interval = random.uniform(0.18, 0.32)
 
     # ==========================================================================
     # Humanized Camera Steering Logic
     # ==========================================================================
     def _apply_humanized_steering(self, error_x: int, now: float):
         """
-        Applies throttled, noisy camera steering with a horizontal center deadzone (38px).
-        Mimics natural human wrist flicks instead of continuous mechanical updates.
+        Applies throttled, noisy camera steering with a horizontal center deadzone (22px).
+        Clamps steering to [-45, 45] with Gaussian noise and slight human overshoot.
         """
-        # Horizontal center deadzone: within 38px, no steering adjustment
-        if abs(error_x) < 38:
+        # Horizontal center deadzone: within 22px, no steering adjustment
+        if abs(error_x) < 22:
             return
 
         # Throttle steering updates to randomized intervals (0.12s - 0.28s)
         if now - self.last_steer_time < self.next_steer_interval:
             return
 
-        kp = float(self.config["Kp_x100"]) / 100.0
+        kp = max(0.01, float(self.config["Kp_x100"]) / 100.0)
 
-        # Gaussian noise (mean 0, sigma 2.2) and slight human overshoot (0.85 - 1.15x)
-        noise = random.gauss(0, 2.2)
+        # Gaussian noise (mean 0, sigma 2.0) and slight human overshoot (0.85 - 1.15x)
+        noise = random.gauss(0, 2.0)
         overshoot = random.uniform(0.85, 1.15)
-        steer_dx = int((error_x * (kp * overshoot)) + noise)
+        raw_dx = (error_x * (kp * overshoot)) + noise
+        steer_dx = max(-45, min(45, int(raw_dx)))
 
         self.hid.move_mouse(steer_dx)
 
@@ -1144,6 +1260,25 @@ class GenshinAssistant:
         combat_color = (0, 0, 255) if self.current_state in (STATE_COMBAT_AUTO, STATE_COMBAT_MANUAL) else (50, 50, 160)
         cv2.rectangle(debug_frame, (kbx1, kby1), (kbx2, kby2), combat_color, 1)
 
+        # 6. Interact Prompt ROI (Teal)
+        iy1, iy2, ix1, ix2 = ROI_INTERACT
+        cv2.rectangle(debug_frame, (ix1, iy1), (ix2, iy2), (180, 180, 0), 1)
+        cv2.putText(debug_frame, "Interact ROI", (ix1 + 5, iy1 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 0), 1)
+
+        # Draw Overworld [F] Prompt Box (Cyan)
+        if (time.time() < self.show_overworld_f_box_until or self.f_prompt_consecutive_frames >= 2) and self.f_prompt_box:
+            bx, by, bw, bh = self.f_prompt_box
+            cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (255, 255, 0), 2)
+            cv2.putText(
+                debug_frame,
+                "OVERWORLD [F]",
+                (bx - 10, by - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 0),
+                2,
+            )
+
         # Draw enemy centroid if available
         if self.combat_target_centroid is not None and self.current_state in (STATE_COMBAT_AUTO, STATE_COMBAT_MANUAL):
             ecx, ecy = self.combat_target_centroid
@@ -1235,6 +1370,19 @@ class GenshinAssistant:
                 (445, 155),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.75,
+                (255, 255, 255),
+                2,
+            )
+
+        # Off-Screen Quest Marker Scan Banner
+        if self.is_scanning_for_marker and self.current_state == STATE_NAVIGATE:
+            cv2.rectangle(debug_frame, (430, 80), (850, 118), (0, 120, 255), -1)
+            cv2.putText(
+                debug_frame,
+                "SCANNING FOR QUEST MARKER...",
+                (450, 107),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
                 (255, 255, 255),
                 2,
             )

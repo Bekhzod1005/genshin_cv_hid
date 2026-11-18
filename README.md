@@ -43,11 +43,14 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
      - Shuffled slots `[2, 3, 4]`: swaps character, casts `E` (85%), casts `Q` (35%), and chains 1–4 `LMB` attacks (pressing unlocked/empty slots on AR 1–10 accounts is safely ignored by the game).
      - Repositioning: 15% chance per cycle to trigger a dash (`RMB`) or jump (`SPACE`).
    - **State 2 — Combat Manual Fallback (`COMBAT_MANUAL`):** If combat runs continuously for `> 45.0` seconds without clearing (e.g. shielded Abyss Mage, scripted boss phase, or cliff occlusion), the assistant immediately halts inputs (`STOP`), sounds an 880 Hz alert chime, and yields control for manual takeover until cleared or resumed via `F12`.
-   - **State 3 — Dialogue Mode (`DIALOGUE`):** Detects minimap disappearance (cutscenes / conversations), monitors the choice options region, and selects dialogue options using `'F'` with log-normal human reaction delays and a 2.0s cooldown.
+   - **State 3 — Dialogue Mode (`DIALOGUE`):** Detects minimap disappearance (cutscenes / conversations), and actively advances both dialogue subtitle lines and choice boxes at a natural log-normal cadence (0.38s–0.78s + 12% probability of a 0.95s–1.45s human pause). The sluggish 2.0s cooldown has been removed for smooth story progression.
    - **State 4 — Overworld Navigation (`NAVIGATE`):** Pulses `'V'` to display quest paths, calculates gold quest marker centroid error relative to screen center, and applies humanized camera steering and variable sprint cadence (`RMB` every 2.1–3.8s).
+     - **Hard Turn Pausing:** If `abs(error_x) > 160` px, pauses forward walking (`W0`) while turning hard (`M<dx>` clamped `[-45, 45]`) until centered, then resumes forward walking.
+     - **Off-Screen Marker Sweep:** When the marker is lost for > 1.2s, stops walking and sweeps the camera horizontally (`22` to `36` px bursts every `0.18s–0.32s`) until the marker re-enters frame.
+     - **Overworld [F] Prompt Interaction:** Monitors `y: 300..490, x: 740..940` for crisp high-contrast near-square `[F]` keycaps (Statues of the Seven, Teleport Waypoints, chests, quest items, NPCs). When confirmed over >= 2 consecutive frames, pauses walking, waits 0.15s–0.28s, and interacts with `F` (1.4s–2.1s cooldown).
 5. **Humanized Steering & Timing:**
-   - **38px Center Deadzone:** Eliminates micro-jitter when already facing the quest marker.
-   - **Gaussian Noise & Overshoot:** Injects `random.gauss(0, 2.2)` and `random.uniform(0.85, 1.15)` gain variance to mimic human wrist flicks.
+   - **22px Center Deadzone:** Tightened to eliminate camera micro-jitter while enabling crisp turns on small offsets.
+   - **Gaussian Noise & Overshoot:** Injects `random.gauss(0, 2.0)` and `random.uniform(0.85, 1.15)` gain variance with default `Kp = 0.14` (tuner range 0.01–0.40).
    - **Throttled Updates:** Steering is updated at randomized 0.12s–0.28s intervals rather than mechanical frame-by-frame loops.
    - **Log-Normal Delays:** All action intervals utilize `human_delay()` with an occasional 10% micro-pause (0.85s–1.55s).
 6. **Obstacle & Stuck Detection:** Performs continuous frame-differencing on the ground region beneath the player character. If `W1` has been held for >2.5s with near-zero visual displacement, the assistant releases keys, flags an obstacle alert, and sounds a warning tone.
