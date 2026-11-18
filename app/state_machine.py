@@ -75,6 +75,7 @@ class AssistantStateMachine:
         # Camera-Locked Sprint with Hysteresis Drift Corridor
         self.nav_mode: str = "ALIGN"  # "ALIGN" (stationary centering) or "CRUISE_LOCKED" (forward sprint, dx=0)
         self.cruise_source: str = "3D"  # "3D" or "MINIMAP"
+        self.align_pitch_steps: int = 0  # Number of upward pitch steps taken in current ALIGN cycle (max 3)
         self.needs_pitch_reset: bool = True  # Automatic upward camera pitch reset on entering navigation
 
         # Staged Obstacle Unstuck State Machine (0.8s hop, 1.7s lateral turn + hop)
@@ -209,6 +210,7 @@ class AssistantStateMachine:
                 self.vacuum_active = False
                 self.vacuum_phase = "IDLE"
                 self.nav_mode = "ALIGN"
+                self.align_pitch_steps = 0
                 self.needs_pitch_reset = True
                 self.next_dialogue_f_time = now + dialogue_advance_delay()
                 if self.is_aiming_bow:
@@ -262,6 +264,7 @@ class AssistantStateMachine:
                 self.vacuum_active = False
                 self.vacuum_phase = "IDLE"
                 self.nav_mode = "ALIGN"
+                self.align_pitch_steps = 0
                 self.needs_pitch_reset = True
                 self.hid.stop_walk()
                 self.hid.stop_all()
@@ -303,6 +306,7 @@ class AssistantStateMachine:
                 old_state = self.current_state
                 self.current_state = STATE_NAVIGATE
                 self.nav_mode = "ALIGN"
+                self.align_pitch_steps = 0
                 self.needs_pitch_reset = True
                 self.combat_ended_time = now
                 self.pending_v_pulse_time = now + random.uniform(0.4, 0.8)
@@ -341,6 +345,7 @@ class AssistantStateMachine:
                 if self.logger:
                     self.logger.log_event("STATE", f"{old_state} -> CHEST_LOOT (sealed chest ring confirmed, ring_box={ring_box}, ring_centroid={ring_centroid})")
             self.nav_mode = "ALIGN"
+            self.align_pitch_steps = 0
             self.needs_pitch_reset = True
             self.active_chest_box = ring_box
             cx, cy = ring_centroid
@@ -387,6 +392,7 @@ class AssistantStateMachine:
         self.hid.press_f()
         self.vacuum_active = True
         self.nav_mode = "ALIGN"
+        self.align_pitch_steps = 0
         self.needs_pitch_reset = True
         self.vacuum_phase = "WAIT_ANIMATION"
         self.vacuum_animation_end_time = now + 0.65
@@ -401,23 +407,6 @@ class AssistantStateMachine:
         self.current_state = STATE_CHEST_LOOT
         if self.logger:
             self.logger.log_event("STATE", f"{old_state} -> CHEST_LOOT (start_loot_vacuum triggered by {trigger_source})")
-        print(f"[LOOT VACUUM] Chest/loot triggered: waiting 0.65s lid animation then {burst_duration:.2f}s vacuum burst.")
-        """Initiates multi-second loot vacuum sequence."""
-        self.hid.stop_walk()
-        self.hid.press_f()
-        self.vacuum_active = True
-        self.nav_mode = "ALIGN"
-        self.needs_pitch_reset = True
-        self.vacuum_phase = "WAIT_ANIMATION"
-        self.vacuum_animation_end_time = now + 0.65
-        burst_duration = random.uniform(2.2, 2.8)
-        self.vacuum_burst_start_time = self.vacuum_animation_end_time
-        self.vacuum_burst_end_time = self.vacuum_animation_end_time + burst_duration
-        self.next_vacuum_f_time = self.vacuum_animation_end_time
-        self.vacuum_taps_count = 1
-        self.vacuum_wiggle_stage = 0
-        self.vacuum_drain_timeout = self.vacuum_burst_end_time + 4.0
-        self.current_state = STATE_CHEST_LOOT
         print(f"[LOOT VACUUM] Chest/loot triggered: waiting 0.65s lid animation then {burst_duration:.2f}s vacuum burst.")
 
     def _execute_loot_vacuum_step(self, now: float, frame: np.ndarray):
@@ -471,6 +460,7 @@ class AssistantStateMachine:
                 self.f_prompt_consecutive_frames = 0
                 self.current_state = STATE_NAVIGATE
                 self.nav_mode = "ALIGN"
+                self.align_pitch_steps = 0
                 self.needs_pitch_reset = True
 
     # ==========================================================================
@@ -620,6 +610,7 @@ class AssistantStateMachine:
         if not self.previous_minimap_state:
             self.pending_v_pulse_time = now + random.uniform(0.3, 0.6)
             self.nav_mode = "ALIGN"
+            self.align_pitch_steps = 0
             self.needs_pitch_reset = True
 
         if self.pending_v_pulse_time and now >= self.pending_v_pulse_time:
@@ -665,6 +656,7 @@ class AssistantStateMachine:
                     self.hid.press_f()
                     self.hid.stop_walk()
                     self.nav_mode = "ALIGN"
+                    self.align_pitch_steps = 0
                     self.needs_pitch_reset = True
                     self.last_overworld_f_time = now
                     self.overworld_f_cooldown = 1.2
@@ -805,6 +797,7 @@ class AssistantStateMachine:
                 if self.logger:
                     self.logger.log_event("NAV", f"Mode CRUISE_LOCKED -> ALIGN (exit_reason: {exit_reason})")
                 self.nav_mode = "ALIGN"
+                self.align_pitch_steps = 0
                 self.hid.stop_walk()
                 # Fall through to ALIGN handling below to begin steering immediately
             else:
@@ -845,16 +838,16 @@ class AssistantStateMachine:
                     self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
                     return
 
-                # Subtle road-following bias if marker is distant/off-center
-                if abs(raw_error_x) > 45 and has_road and road_bearing is not None and self.config.get("road_following_enabled", True):
-                    road_offset_x = road_bearing * (640.0 / (math.pi / 2.5))
-                    effective_error_x = 0.70 * raw_error_x + 0.30 * road_offset_x
-                else:
-                    effective_error_x = float(raw_error_x)
+                # ALIGN steers 100% purely from raw_error_x (no minimap or road blending)
+                effective_error_x = float(raw_error_x)
 
                 dx, _ = self.steering.compute_steering(effective_error_x, now)
-                # Upward pitch step if marker sits near top edge (cy < 175 px)
-                dy = -10 if cy < 175 else 0
+                # Upward pitch step capped at 3 steps per ALIGN cycle, only when cy < 140 and dx != 0
+                if cy < 140 and dx != 0 and self.align_pitch_steps < 3:
+                    dy = -4
+                    self.align_pitch_steps += 1
+                else:
+                    dy = 0
 
                 if dx != 0 or dy != 0:
                     self.hid.move_mouse(dx, dy)
@@ -866,90 +859,97 @@ class AssistantStateMachine:
                 self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
                 return
 
-            # Case 2: 3D Marker off-screen, Minimap Quest Bearing Present
-            elif quest_bearing is not None:
-                self.is_scanning_for_marker = False
-                self._set_lost_marker_phase("IDLE", "minimap bearing active")
-                self.lost_marker_start_time = 0.0
-                self.lost_marker_step_count = 0
-
-                # Check 'V' pulse for occluded 3D marker every 5.0s
+            else:
+                # 0.45s Grace Buffer Before Falling Back to Minimap Bearing / Lost Recovery
                 time_lost = now - self.marker_last_seen_time
-                v_delay = float(self.config.get("lost_marker_v_delay", 0.8))
-                v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
-                if time_lost > v_delay and (now - self.last_quest_v_pulse_time >= v_cooldown):
-                    self.hid.press_v()
-                    if self.logger:
-                        self.logger.log_event("NAV", f"Dispatched 'V' pulse (occluded marker, lost for {time_lost:.2f}s > {v_delay}s)")
-                    self.last_quest_v_pulse_time = now
-                    print(f"[NAV] Quest marker occluded ({time_lost:.2f}s > {v_delay}s): dispatched 'V' pulse.")
-
-                bearing_deg = abs(math.degrees(quest_bearing))
-                if bearing_deg <= 20.0:
-                    print(f"[NAV] Aligned with minimap bearing ({bearing_deg:.1f} deg <= 20 deg) -> CRUISE_LOCKED")
-                    if self.logger:
-                        self.logger.log_event("NAV", f"Mode ALIGN -> CRUISE_LOCKED (aligned with minimap bearing {bearing_deg:.1f} deg <= 20.0 deg)")
-                    self.nav_mode = "CRUISE_LOCKED"
-                    self.cruise_source = "MINIMAP"
-                    if not self.vacuum_active:
-                        self.hid.start_walk()
+                if time_lost < 0.45:
+                    # Brief single-frame template flicker: hold heading (dx=0), do not pivot or sweep
                     self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
                     return
 
-                pivot_dx, _ = self.steering.compute_minimap_pivot(quest_bearing, now)
-                if pivot_dx != 0:
-                    self.hid.move_mouse(pivot_dx, 0)
-                self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
-                return
-
-            # Case 3: Lost Marker 4-Phase Recovery Routine (No Endless Rotation)
-            else:
-                if self.lost_marker_phase == "IDLE":
-                    self._set_lost_marker_phase("WAIT_INITIAL", "start recovery")
-                    self.lost_marker_start_time = now
+                # Case 2: 3D Marker off-screen, Minimap Quest Bearing Present
+                if quest_bearing is not None:
+                    self.is_scanning_for_marker = False
+                    self._set_lost_marker_phase("IDLE", "minimap bearing active")
+                    self.lost_marker_start_time = 0.0
                     self.lost_marker_step_count = 0
 
-                if self.lost_marker_phase == "WAIT_INITIAL":
-                    if now - self.lost_marker_start_time >= float(self.config.get("lost_marker_v_delay", 0.8)):
+                    # Check 'V' pulse for occluded 3D marker every 5.0s
+                    v_delay = float(self.config.get("lost_marker_v_delay", 0.8))
+                    v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
+                    if time_lost > v_delay and (now - self.last_quest_v_pulse_time >= v_cooldown):
+                        self.hid.press_v()
+                        if self.logger:
+                            self.logger.log_event("NAV", f"Dispatched 'V' pulse (occluded marker, lost for {time_lost:.2f}s > {v_delay}s)")
+                        self.last_quest_v_pulse_time = now
+                        print(f"[NAV] Quest marker occluded ({time_lost:.2f}s > {v_delay}s): dispatched 'V' pulse.")
+
+                    bearing_deg = abs(math.degrees(quest_bearing))
+                    if bearing_deg <= 20.0:
+                        print(f"[NAV] Aligned with minimap bearing ({bearing_deg:.1f} deg <= 20 deg) -> CRUISE_LOCKED")
+                        if self.logger:
+                            self.logger.log_event("NAV", f"Mode ALIGN -> CRUISE_LOCKED (aligned with minimap bearing {bearing_deg:.1f} deg <= 20.0 deg)")
+                        self.nav_mode = "CRUISE_LOCKED"
+                        self.cruise_source = "MINIMAP"
+                        if not self.vacuum_active:
+                            self.hid.start_walk()
+                        self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
+                        return
+
+                    pivot_dx, _ = self.steering.compute_minimap_pivot(quest_bearing, now)
+                    if pivot_dx != 0:
+                        self.hid.move_mouse(pivot_dx, 0)
+                    self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
+                    return
+
+                # Case 3: Lost Marker 4-Phase Recovery Routine (No Endless Rotation)
+                else:
+                    if self.lost_marker_phase == "IDLE":
+                        self._set_lost_marker_phase("WAIT_INITIAL", "start recovery")
+                        self.lost_marker_start_time = now
+                        self.lost_marker_step_count = 0
+
+                    if self.lost_marker_phase == "WAIT_INITIAL":
+                        if now - self.lost_marker_start_time >= float(self.config.get("lost_marker_v_delay", 0.8)):
+                            v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
+                            if now - self.last_quest_v_pulse_time >= v_cooldown:
+                                self.hid.press_v()
+                                if self.logger:
+                                    self.logger.log_event("NAV", "Dispatched 'V' pulse (lost marker recovery Phase 1)")
+                                self.last_quest_v_pulse_time = now
+                                print("[NAV] Lost marker: dispatched 'V' pulse.")
+                            self._set_lost_marker_phase("WAIT_V_PULSE", "0.8s wait expired")
+                            self.lost_marker_start_time = now
+
+                    elif self.lost_marker_phase == "WAIT_V_PULSE":
+                        if now - self.lost_marker_start_time >= 1.0:
+                            self._set_lost_marker_phase("STEP_SWEEP", "1.0s wait expired")
+                            self.lost_marker_step_count = 0
+                            self.last_step_sweep_time = now
+
+                    elif self.lost_marker_phase == "STEP_SWEEP":
+                        self.is_scanning_for_marker = True
+                        if now - self.last_step_sweep_time >= 0.28:
+                            if self.lost_marker_step_count < 8:
+                                step_dx = 32 * self.scan_sweep_direction
+                                self.hid.move_mouse(step_dx, 0)
+                                self.lost_marker_step_count += 1
+                                self.last_step_sweep_time = now
+                            else:
+                                print(f"[NAV] Completed 8-step scan sweep ({self.lost_marker_step_count}/8). Stopping rotation.")
+                                self.is_scanning_for_marker = False
+                                self._set_lost_marker_phase("SWEEP_COMPLETE", "8 steps completed")
+
+                    elif self.lost_marker_phase == "SWEEP_COMPLETE":
+                        self.is_scanning_for_marker = False
                         v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
                         if now - self.last_quest_v_pulse_time >= v_cooldown:
                             self.hid.press_v()
                             if self.logger:
-                                self.logger.log_event("NAV", "Dispatched 'V' pulse (lost marker recovery Phase 1)")
+                                self.logger.log_event("NAV", "Dispatched 'V' pulse (lost marker recovery Phase 4 cooldown expired)")
                             self.last_quest_v_pulse_time = now
-                            print("[NAV] Lost marker: dispatched 'V' pulse.")
-                        self._set_lost_marker_phase("WAIT_V_PULSE", "0.8s wait expired")
-                        self.lost_marker_start_time = now
+                            print("[NAV] V cooldown expired in idle: dispatched 'V' pulse.")
+                            self._set_lost_marker_phase("WAIT_V_PULSE", "cooldown expired")
+                            self.lost_marker_start_time = now
 
-                elif self.lost_marker_phase == "WAIT_V_PULSE":
-                    if now - self.lost_marker_start_time >= 1.0:
-                        self._set_lost_marker_phase("STEP_SWEEP", "1.0s wait expired")
-                        self.lost_marker_step_count = 0
-                        self.last_step_sweep_time = now
-
-                elif self.lost_marker_phase == "STEP_SWEEP":
-                    self.is_scanning_for_marker = True
-                    if now - self.last_step_sweep_time >= 0.28:
-                        if self.lost_marker_step_count < 8:
-                            step_dx = 32 * self.scan_sweep_direction
-                            self.hid.move_mouse(step_dx, 0)
-                            self.lost_marker_step_count += 1
-                            self.last_step_sweep_time = now
-                        else:
-                            print(f"[NAV] Completed 8-step scan sweep ({self.lost_marker_step_count}/8). Stopping rotation.")
-                            self.is_scanning_for_marker = False
-                            self._set_lost_marker_phase("SWEEP_COMPLETE", "8 steps completed")
-
-                elif self.lost_marker_phase == "SWEEP_COMPLETE":
-                    self.is_scanning_for_marker = False
-                    v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
-                    if now - self.last_quest_v_pulse_time >= v_cooldown:
-                        self.hid.press_v()
-                        if self.logger:
-                            self.logger.log_event("NAV", "Dispatched 'V' pulse (lost marker recovery Phase 4 cooldown expired)")
-                        self.last_quest_v_pulse_time = now
-                        print("[NAV] V cooldown expired in idle: dispatched 'V' pulse.")
-                        self._set_lost_marker_phase("WAIT_V_PULSE", "cooldown expired")
-                        self.lost_marker_start_time = now
-
-                self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
+                    self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)

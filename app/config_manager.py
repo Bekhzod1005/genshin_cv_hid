@@ -81,10 +81,10 @@ STATE_NAVIGATE = "NAVIGATE"
 # Hardcoded Calibrated Defaults (v5 Two-Zone PD Architecture)
 # ==============================================================================
 HARDCODED_DEFAULTS = {
-    "Kp_fine": 0.26,
-    "Kd": 0.09,
-    "Kp_fast": 0.44,
-    "steer_rate_hz": 28,
+    "Kp_fine": 0.16,
+    "Kd": 0.06,
+    "Kp_fast": 0.26,
+    "steer_rate_hz": 20,
     "center_lock_deadzone": 24,
     "cruise_drift_corridor": 95,
     "default_pitch_up_counts": -30,

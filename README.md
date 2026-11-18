@@ -93,10 +93,16 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
    - Actively tracks the enemy's moving HP bar with 2-axis mouse steering (`M<dx>,<dy>`) *while* `LMB_HOLD` charges Amber's shot, rate-limited to **28 Hz** (`0.035s`) to prevent serial buffer saturation.
 6. **Two-Zone PD Camera Steering & Pivot-in-Place:**
    - Firmware micro-stepped mouse movement widened to `[-110, 110]` with $16$-count steps spaced $900\,\mu$s apart.
-   - Python PD controller operates at **28 Hz** ($0.035$s update interval) without pre-PD EMA lag:
+   - Python PD controller operates at **20 Hz** ($0.050$s update interval) without pre-PD EMA lag:
+     - **Pure 3D Error in ALIGN:** `ALIGN` mode steers 100% purely from `raw_error_x` with no road bias or minimap cancellation.
+     - **0.45s Flicker Grace Buffer:** Single-frame template drops hold $dx = 0$ for $0.45$s before falling back to minimap bearing or initiating recovery routines.
      - **Zone 1 (Deadzone $|error\_x| \le 24$ px):** $dx = 0$, hard center lock.
-     - **Zone 2 (Fine PD $24 < |error\_x| \le 130$ px):** $Kp = 0.26$, $Kd = 0.09$, clamped to $[-45, 45]$.
-     - **Zone 3 (Fast Pivot $|error\_x| > 130$ px):** $Kp = 0.44$, $Kd = 0.10$, clamped to $[-95, 95]$.
+     - **Zone 2 (Fine PD $24 < |error\_x| \le 130$ px):** $Kp = 0.16$, $Kd = 0.06$, clamped to $[-28, 28]$.
+     - **Zone 3 (Fast Pivot $|error\_x| > 130$ px):** $Kp = 0.26$, $Kd = 0.06$, clamped to $[-52, 52]$.
+     - **Minimap Pivot:** Clamped to $[-48, 48]$ at 20 Hz.
+     - **Upward Pitch Capping:** Upward pitch steps ($dy = -4$) only occur when $cy < 140$ and $dx \ne 0$, capped at 3 steps per `ALIGN` cycle to prevent sky drift.
+     - **Unfocused STOP Deduplication:** Background/pause state sends emergency `STOP` once on transition rather than spamming at 30 Hz.
+     - **Dark-Outline Minimap Blip Rejection:** Gold minimap blips require tight HSV ($H: 20..32, S: 205..255, V: 225..255$), area $12..55$ px, aspect ratio $0.75..1.35$, and $\ge 35\%$ dark border pixels ($V < 125$) to reject sunlit cliffs/grass.
      - **Pivot-in-Place:** Automatically pauses forward walking (`W0`) whenever $|error\_x| > 115$ px or when turning toward an off-screen minimap bearing.
 10. **Safe OpenCV Window Lifecycle:**
     - Guarded with `cv2.getWindowProperty` and `try...except cv2.error` handlers so clicking the Windows `X` button closes the application safely without crashes.
@@ -271,6 +277,6 @@ python app/main.py --dry-run
 | **`F12`** | Global (Any Window) | **Instant Pause / Resume Toggle**. Immediately releases all held keys (`STOP`), clears queues, and suspends automation. |
 | **`T`** | Debug Window | **Capture Active Diamond Template**. Crops a 28x28 patch around the tracked marker and saves to `assets/quest_gold.png` or `assets/quest_blue.png`. |
 | **Mouse Click** | Debug Window | **Crop Template At Cursor**. Left-click on any quest diamond on the live debug window to instantly save a 28x28 reference template. |
-| **`D`** | Debug Window | **Reset Configuration to Defaults**. Restores hardcoded defaults (`Kp_fine = 0.26`, `Kd = 0.09`, `Kp_fast = 0.44`, `threshold = 0.64`, etc.) and updates `config.json`. |
+| **`D`** | Debug Window | **Reset Configuration to Defaults**. Restores hardcoded defaults (`Kp_fine = 0.16`, `Kd = 0.06`, `Kp_fast = 0.26`, `steer_rate_hz = 20`, `threshold = 0.50`, etc.) and updates `config.json`. |
 | **`S`** | Debug Window | **Save Configuration**. Saves current configuration to `config.json`. |
 | **`Q`** / **`ESC`** | Debug Window | **Clean Shutdown**. Issues emergency `STOP` command to ESP32-S3, closes serial, and destroys OpenCV windows. |

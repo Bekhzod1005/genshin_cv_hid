@@ -184,10 +184,11 @@ class ESP32HIDController:
 class PDSteeringController:
     """
     Two-Zone PD Camera Steering & Pivot-in-Place Controller.
-    - Operates at 28 Hz (0.035s rate limit) without pre-PD EMA lag.
+    - Operates at 20 Hz (0.050s rate limit) without pre-PD EMA lag.
     - Zone 1: Center Deadzone (|error_x| <= 24 px) -> dx = 0, hard center lock.
-    - Zone 2: Fine PD Tracking (24 < |error_x| <= 130 px) -> Kp_fine = 0.26, Kd = 0.09, clamped [-45, 45].
-    - Zone 3: Fast Turn & Pivot-in-Place (|error_x| > 130 px) -> Kp_fast = 0.44, Kd = 0.10, clamped [-95, 95].
+    - Zone 2: Fine PD Tracking (24 < |error_x| <= 130 px) -> Kp_fine = 0.16, Kd = 0.06, clamped [-28, 28].
+    - Zone 3: Fast Turn & Pivot-in-Place (|error_x| > 130 px) -> Kp_fast = 0.26, Kd = 0.06, clamped [-52, 52].
+    - Minimap Pivot: Clamped [-48, 48] at 20 Hz.
     - Walking Pause: Immediately stops walking (W0) when |error_x| > 115 px or turning towards minimap bearing.
     """
 
@@ -200,6 +201,7 @@ class PDSteeringController:
     def compute_steering(self, raw_error_x: float, now: float) -> Tuple[int, bool]:
         """
         Calculate mouse steering delta and whether walking should be paused.
+        Steers 100% purely from raw_error_x (no minimap or road blending).
         Returns: (dx, should_pause_walk)
         """
         deadzone = float(self.config.get("center_lock_deadzone", 24))
@@ -213,8 +215,8 @@ class PDSteeringController:
             self.filtered_derivative = 0.0
             return 0, False
 
-        # Rate limiter: default 28 Hz (0.035s)
-        rate_hz = float(self.config.get("steer_rate_hz", 28))
+        # Rate limiter: default 20 Hz (0.050s)
+        rate_hz = float(self.config.get("steer_rate_hz", 20))
         min_interval = 1.0 / max(10.0, rate_hz)
         if now - self.last_packet_time < min_interval:
             # Maintain walking pause state if error is large
@@ -230,24 +232,24 @@ class PDSteeringController:
         self.filtered_derivative = 0.75 * self.filtered_derivative + 0.25 * raw_d
         self.prev_error_x = raw_error_x
 
-        kd = float(self.config.get("Kd", 0.09))
+        kd = float(self.config.get("Kd", 0.06))
         d_term = kd * self.filtered_derivative
 
         # Humanized slight noise & overshoot
-        noise = random.gauss(0, 1.2)
-        overshoot = random.uniform(0.92, 1.08)
+        noise = random.gauss(0, 0.8)
+        overshoot = random.uniform(0.95, 1.05)
 
         if abs_err <= 130:
             # Zone 2: Fine PD Tracking
-            kp = float(self.config.get("Kp_fine", 0.26))
+            kp = float(self.config.get("Kp_fine", 0.16))
             raw_dx = (kp * raw_error_x * overshoot) + d_term + noise
-            dx = max(-45, min(45, int(raw_dx)))
+            dx = max(-28, min(28, int(raw_dx)))
             should_pause_walk = abs_err > pivot_thresh
         else:
             # Zone 3: Fast Turn & Pivot-in-Place
-            kp = float(self.config.get("Kp_fast", 0.44))
+            kp = float(self.config.get("Kp_fast", 0.26))
             raw_dx = (kp * raw_error_x * overshoot) + d_term + noise
-            dx = max(-95, min(95, int(raw_dx)))
+            dx = max(-52, min(52, int(raw_dx)))
             should_pause_walk = True
 
         self.last_packet_time = now
@@ -258,7 +260,7 @@ class PDSteeringController:
         When 3D marker is off-screen, instantly steer directly towards the minimap quest bearing.
         Returns: (dx, should_pause_walk)
         """
-        rate_hz = float(self.config.get("steer_rate_hz", 28))
+        rate_hz = float(self.config.get("steer_rate_hz", 20))
         min_interval = 1.0 / max(10.0, rate_hz)
         if now - self.last_packet_time < min_interval:
             return 0, True
@@ -269,9 +271,10 @@ class PDSteeringController:
         if abs_deg <= 8.0:
             return 0, False
 
-        # Sharp turn towards off-screen bearing
-        speed_magnitude = min(95, max(36, int(abs_deg * 0.95)))
+        # Turn towards off-screen bearing clamped to [-48, 48] at 20 Hz
+        speed_magnitude = min(48, max(20, int(abs_deg * 0.65)))
         dx = int(math.copysign(speed_magnitude, bearing_deg))
+        dx = max(-48, min(48, dx))
 
         should_pause_walk = abs_deg > 25.0
         self.last_packet_time = now

@@ -140,6 +140,7 @@ class GenshinAssistantApp:
         self.sm = AssistantStateMachine(self.hid, self.detector, self.config, logger=self.logger)
 
         self.prev_is_focused: Optional[bool] = None
+        self.is_unfocused_or_paused: bool = False
 
         # Log [BOOT] metadata
         gold_dim = f"{self.detector.quest_gold_template.shape[1]}x{self.detector.quest_gold_template.shape[0]}" if self.detector.quest_gold_template is not None else "None"
@@ -329,19 +330,23 @@ class GenshinAssistantApp:
 
                     # 3. SAFETY GUARD: Active-Window Focus Check & F12 Pause
                     if not is_focused or self.global_paused:
-                        self.hid.stop_all()
+                        if not self.is_unfocused_or_paused or self.hid.is_walking or self.hid.is_lmb_held:
+                            self.hid.stop_all()
+                            self.is_unfocused_or_paused = True
                         self.sm.combat_consecutive_frames = 0
                         self.sm.sealed_chest_consecutive_frames = 0
                         self.sm.f_prompt_consecutive_frames = 0
                         self.sm.vacuum_active = False
                         self.sm.vacuum_phase = "IDLE"
                         self.sm.nav_mode = "ALIGN"
+                        self.sm.align_pitch_steps = 0
                         self.sm.needs_pitch_reset = True
                         if self.sm.is_aiming_bow:
                             self.hid.press_r()
                             self.sm.is_aiming_bow = False
                             self.sm.bow_substate = "AIM_IDLE"
                     else:
+                        self.is_unfocused_or_paused = False
                         # 4. Execute State Machine
                         self.sm.process_frame(frame, frame_half, frame_idx)
 

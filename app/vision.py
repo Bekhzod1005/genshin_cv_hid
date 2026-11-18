@@ -159,29 +159,33 @@ class VisionDetector:
         cv2.circle(local_annulus, (r, r), 66, 255, -1)
         cv2.circle(local_annulus, (r, r), 18, 0, -1)
 
-        # Isolated Gold Quest Diamond blip: H: 19..33, S: 175..255, V: 205..255
-        gold_mask = cv2.inRange(hsv_mini, np.array([19, 175, 205]), np.array([33, 255, 255]))
+        # Isolated Gold Quest Diamond blip: H: 20..32, S: 205..255, V: 225..255
+        gold_mask = cv2.inRange(hsv_mini, np.array([20, 205, 225]), np.array([32, 255, 255]))
         gold_in_annulus = cv2.bitwise_and(gold_mask, local_annulus)
+        val_mini = hsv_mini[:, :, 2]
 
         quest_bearing = None
         blip_type = None
 
-        # Check Gold blips
+        # Check Gold blips (strict area, aspect ratio, and dark outline to reject sunlit terrain)
         q_contours, _ = cv2.findContours(gold_in_annulus, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for qc in q_contours:
             area = cv2.contourArea(qc)
-            if 10 <= area <= 65:
+            if 12 <= area <= 55:
                 bx, by, bw, bh = cv2.boundingRect(qc)
-                if bw <= 12 and bh <= 12:
-                    M = cv2.moments(qc)
-                    if M["m00"] > 0:
-                        q_local_x = M["m10"] / M["m00"]
-                        q_local_y = M["m01"] / M["m00"]
-                        dx = q_local_x - r
-                        dy = q_local_y - r
-                        quest_bearing = math.atan2(dx, -dy)
-                        blip_type = "GOLD"
-                        break
+                if bh > 0:
+                    aspect_ratio = float(bw) / float(bh)
+                    if 0.75 <= aspect_ratio <= 1.35:
+                        if self._has_dark_outline(val_mini, qc, bx, by, bw, bh):
+                            M = cv2.moments(qc)
+                            if M["m00"] > 0:
+                                q_local_x = M["m10"] / M["m00"]
+                                q_local_y = M["m01"] / M["m00"]
+                                dx = q_local_x - r
+                                dy = q_local_y - r
+                                quest_bearing = math.atan2(dx, -dy)
+                                blip_type = "GOLD"
+                                break
 
         # Road segmentation
         local_circle = np.zeros((2 * r, 2 * r), dtype=np.uint8)
