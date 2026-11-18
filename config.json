@@ -7,5 +7,10 @@
   "V_max": 255,
   "Kp_x100": 14,
   "steer_ema_alpha": 0.35,
-  "road_following_enabled": true
+  "road_following_enabled": true,
+  "center_lock_deadzone": 28,
+  "blue_marker_enabled": true,
+  "quest_v_pulse_cooldown": 4.5,
+  "lost_marker_v_delay": 0.75,
+  "lost_marker_sweep_delay": 1.65
 }

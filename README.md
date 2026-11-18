@@ -50,10 +50,13 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
      - **High-Confidence Sealed Ring Detection:** Detects only high-saturation glowing crimson (`H: 0..8` / `172..180`, `S: 175..255`, `V: 170..255`) or anemo-teal (`H: 82..98`, `S: 160..255`, `V: 170..255`) circular lock rings in a tighter mid-screen ROI (`x: 300..980, y: 220..560`) with aspect ratio filtering (`0.70..1.35`, area `350..3200 px`). Broad terrain/brown color guessing has been removed to eliminate false positives on Mondstadt dirt paths and rocks.
      - **Multi-Second Loot Vacuum:** Upon opening a chest or triggering an overworld `[F]` prompt, halts movement (`W0`), waits 0.65s for the chest lid opening animation and scattered drops to hit the ground, and enters a 2.2s–2.8s vacuum burst tapping `F` every 0.16s–0.24s (10–14 taps total) while executing a gentle left/right camera wiggle (`M-18,0` $\rightarrow$ `M36,0` $\rightarrow$ `M-18,0`). Continues draining stacked item drop lists until the `[F]` prompt box is cleared.
    - **State 4 — Overworld Navigation (`NAVIGATE`):**
+     - **Hybrid Gold & Blue Quest Marker Tracking:** Detects both Gold (Archon / Story quests) and Cyan-Blue (World / Daily Commission quests) using multi-scale template matching (`assets/quest_gold.png` & `assets/quest_blue.png`) combined with HSV color confirmation. Includes sky/water background rejection (<45% blue pixels in surrounding 48x48 box) to avoid false locks on rivers and Mondstadt skies.
+     - **Stamina & Character Exclusion Zone:** Automatically masks out `x: 520..760, y: 240..540` from quest detection so the curved yellow stamina arc next to Lumine never biases the marker centroid.
+     - **Hard Center Lock:** When the marker is centered ($|error\_x| \le 28$ px), camera steering is strictly zeroed (`dx = 0`) and minimap road bias is suppressed to eliminate post-lock camera drift. Road-following bias is only applied when the marker is distant/off-center ($|error\_x| > 45$ px).
+     - **Lost-Marker Recovery (Pulse 'V' First):** If neither a gold nor blue marker is detected for $> 0.75$s, dispatches `V` (4.5s cooldown) to re-illuminate the navigation trail. Waits 0.9s (total $> 1.65$s); only if the marker remains undetected does it halt walking (`W0`) and begin slow horizontal camera sweeps (`M<dx>`).
      - **Minimap Road-Following:** Segments dirt roads and paths within the circular minimap, calculating path centerline bearing. Biases movement towards roads when within $\pm 55^\circ$ of quest target.
      - **Smoothed Camera Steering:** Camera mouse steering uses Exponential Moving Average (EMA, $\alpha=0.35$) with rate limiting (max 15–20 Hz) to eliminate micro-stutter.
      - **Hard Turn Pausing:** Stops walking (`W0`) during sharp turns ($|error\_x| > 160$ px) to prevent wide drifting.
-     - **Off-Screen Marker Sweep:** Slow horizontal sweep when quest marker is lost for > 1.2s.
      - **Obstacle Jumping & Unstuck Logic:** Frame differencing on the player feet region detects terrain obstacles. Automatically triggers `SPACE` jump after 1.8s of stall, followed by lateral evasion if stuck persists.
      - **Overworld [F] Prompt Interaction:** Interacts with Waypoints, Statues, items, and NPCs.
 5. **Firmware Hardware TRNG & Extended Watchdog:** ESP32-S3 uses true hardware random numbers (`esp_random()`) and a 15-second watchdog timer, complemented by 4-second Python navigation keepalive pings.
@@ -218,6 +221,8 @@ python app/main.py --dry-run
 | Hotkey | Context | Action |
 |---|---|---|
 | **`F12`** | Global (Any Window) | **Instant Pause / Resume Toggle**. Immediately releases all held keys (`STOP`), clears queues, and suspends automation. |
+| **`C`** | Debug Window | **Capture Active Diamond Template**. Crops a 28x28 patch around the tracked marker and saves to `assets/quest_gold.png` or `assets/quest_blue.png`. |
+| **Mouse Click** | Debug Window | **Crop Template At Cursor**. Click on any quest diamond on the live debug window to instantly save a 28x28 template. |
 | **`S`** | Debug Window | **Save Configuration**. Saves current Tuner HSV thresholds, EMA alpha, and `Kp_x100` gain to `config.json`. |
 | **`Q`** / **`ESC`** | Debug Window | **Clean Shutdown**. Issues emergency `STOP` command to ESP32-S3, closes serial, and destroys OpenCV windows. |
 
