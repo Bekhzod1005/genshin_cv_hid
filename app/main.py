@@ -1022,7 +1022,7 @@ class VisionDetector:
 
         # 3. Dark charcoal/navy border ring (V < 145)
         dark_mask = patch_hsv[:, :, 2] < 145
-        dark_count = np.countNonZero(dark_mask)
+        dark_count = np.count_nonzero(dark_mask)
         has_dark_border = dark_count >= 4
 
         if has_cyan_core and has_dark_border:
