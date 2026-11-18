@@ -1,5 +1,5 @@
 /*
- * ESP32-S3 Native USB HID Keyboard & Mouse Controller for Genshin Impact CV Assistant (v4)
+ * ESP32-S3 Native USB HID Keyboard & Mouse Controller for Genshin Impact CV Assistant (v5)
  * 
  * Hardware:
  *   ESP32-S3 (e.g. ESP32-S3-DevKitC-1 or compatible)
@@ -12,11 +12,11 @@
  *   USB Firmware MSC:   "Disabled"
  *   Upload Mode:        "UART0 / Hardware CDC" (or "USB-OTG")
  * 
- * Non-Blocking v4 Features:
- *   - Zero-delay non-blocking millis() release table (MAX_TAPS = 6)
- *   - Serial.setRxBufferSize(512) for smooth packet streaming
+ * Non-Blocking v5 Architecture:
+ *   - Zero-delay non-blocking millis() release scheduler (MAX_TAPS = 6)
+ *   - Serial.setRxBufferSize(512) for high-rate command packet streaming
  *   - Decoupled hold states: W0 releases 'w' only; LMB_REL releases mouse only
- *   - Micro-stepped mouse movement (max 16 counts, 1200us spacing)
+ *   - High-speed micro-stepped mouse movement (clamped [-110, 110], 16-count steps, 900us spacing)
  *   - 12-second hardware safety watchdog
  * 
  * Protocol (Newline-terminated ASCII commands):
@@ -35,8 +35,8 @@
  *   W1             -> Hold 'w' key down (continuous forward movement)
  *   W0             -> Release 'w' key only (continuous forward movement pause)
  *   STOP           -> Immediately release all keyboard keys, mouse buttons, and queues
- *   M<dx>          -> Smooth relative horizontal mouse move (micro-stepped <= 16 counts)
- *   M<dx>,<dy>     -> Smooth relative 2-axis mouse move (micro-stepped <= 16 counts)
+ *   M<dx>          -> High-speed smooth relative mouse move (clamped [-110, 110], <= 16 counts/step)
+ *   M<dx>,<dy>     -> High-speed smooth 2-axis mouse move (clamped [-110, 110], <= 16 counts/step)
  */
 
 #include "USB.h"
@@ -171,10 +171,10 @@ void clearScheduledReleases() {
   }
 }
 
-// Micro-stepped mouse movement: chunks of max 16 counts spaced 1200us apart
+// Micro-stepped mouse movement: chunks of max 16 counts spaced 900us apart, clamped to [-110, 110]
 void moveMouseSmooth(int totalDx, int totalDy) {
-  int remX = constrain(totalDx, -50, 50);
-  int remY = constrain(totalDy, -50, 50);
+  int remX = constrain(totalDx, -110, 110);
+  int remY = constrain(totalDy, -110, 110);
 
   while (remX != 0 || remY != 0) {
     int stepX = constrain(remX, -16, 16);
@@ -185,7 +185,7 @@ void moveMouseSmooth(int totalDx, int totalDy) {
     remY -= stepY;
 
     if (remX != 0 || remY != 0) {
-      delayMicroseconds(1200);
+      delayMicroseconds(900);
     }
   }
 }

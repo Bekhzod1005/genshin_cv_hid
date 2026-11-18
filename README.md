@@ -1,8 +1,8 @@
-# Genshin Impact Hardware-Assisted CV Automation (v4)
+# Genshin Impact Hardware-Assisted CV Automation (v5 Modular Architecture)
 
 A production-grade, self-contained computer-vision navigation, dialogue, chest-looting, and **starter-roster auto-combat** assistant for **Genshin Impact** running on Windows (1280x720 Borderless or Windowed mode). 
 
-Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard and mouse inputs are generated physically through an **ESP32-S3** microcontroller emulating a native USB HID composite device (TinyUSB Keyboard + Mouse) with a non-blocking hardware scheduler and micro-stepped camera rotation.
+Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard and mouse inputs are generated physically through an **ESP32-S3** microcontroller emulating a native USB HID composite device (TinyUSB Keyboard + Mouse) with a non-blocking hardware scheduler and high-speed micro-stepped camera rotation.
 
 ```
  ┌─────────────────────────────────────────────────────────────┐
@@ -34,45 +34,46 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
 
 ---
 
-## Key Features & Safety Architecture
+## v5 Architecture & Audited Bug Fixes
 
-1. **Non-Blocking Hardware-Assisted Physical Input (v4):**
-   - **Zero-Delay Keystroke Scheduler:** Completely removes blocking `delay()` calls from the command parser. A non-blocking `millis()` release table (`MAX_TAPS = 6`) handles humanized hold durations (48–112 ms) asynchronously in `loop()`, allowing incoming `M<dx>,<dy>` camera packets to execute instantaneously without queuing delay.
-   - **Expanded RX Buffer:** Allocates `Serial.setRxBufferSize(512)` on the ESP32-S3 for smooth, high-frequency command streaming.
-   - **Decoupled Hold States:** Forward walk (`W1`/`W0`) and mouse charge (`LMB_HOLD`/`LMB_REL`) operate independently. Sending `W0` releases only `'w'`—never invoking `Keyboard.releaseAll()` or aborting held bow charges.
-   - **Micro-Stepped Mouse Moves (`moveMouseSmooth`):** Sub-steps mouse movements into chunks of maximum `16` counts spaced `1200` microseconds apart, preventing Genshin's 3D camera engine from triggering pointer-acceleration snaps.
-2. **Active-Window Focus Lock:** Continuously checks `win32gui.GetForegroundWindow() == hwnd`. If Genshin Impact loses focus, the assistant immediately sends `STOP` and suspends automation to prevent typing or clicking in other applications.
-3. **Global `F12` Instant Pause Toggle:** Monitored system-wide via `pynput`. Pressing `F12` at any time immediately disengages inputs, releases all keys/buttons, and clears combat and navigation queues.
-4. **Strict State Hierarchy & Arbitration (`DIALOGUE > COMBAT_AUTO > CHEST_LOOT > NAVIGATE`):**
-   - **State 1 — Dialogue Mode (`DIALOGUE` - Top Priority):** When the top-left minimap is hidden, the system locks into dialogue mode. Any held combat or movement keys (`W0`, `LMB_REL`) are immediately released. Rapidly advances subtitles and menu choices via natural log-normal cadences (0.38s–0.78s) without triggering false combat or navigation actions.
-   - **State 2 — Starter-Roster Auto-Combat (`COMBAT_AUTO` & `COMBAT_MANUAL`):**
-     - **Strict Horizontal HP-Bar Geometry (Sunset Sky Rejection):** To completely prevent false combat triggers from red sunset clouds, dawn horizons, torches, and fiery terrain, enemy detection scans `x: 160..1120, y: 120..560` using a tight crimson threshold (`H: 0..5` or `175..180`, `S: 185..255`, `V: 175..255`) and strictly enforces HP-bar geometry: `34 <= width <= 140` px, `3 <= height <= 10` px, aspect ratio `width / height >= 5.5`, and fill extent `area / (width * height) >= 0.65`. Additionally requires `>= 2` consecutive frames with valid bars before entering `COMBAT_AUTO`.
-     - **Immediate Stop:** Halts walking (`W0`) upon engaging targets to avoid sprinting past enemies.
-     - **Dynamic Party-Size Awareness:** Automatically detects active party size (1 to 4 slots) from the right-hand HUD stack, preventing invalid keypresses on new accounts (e.g. only pressing `1` and `2` before unlocking Kaeya/Lisa).
-     - **Deliberate Pacing:** 3-hit `LMB` attack combos spaced 0.32s–0.58s with natural pauses or `RMB` dodges; `E` skills (6.5s–8.5s); `Q` bursts (12.0s–15.0s); character rotations paced every 7.0s–10.0s.
-     - **Amber Bow Aim-Shot Mode:** Automatically swaps to Amber (slot 2) and enters Aim Mode (`R`) when fighting elevated/tower enemies or when melee damage stalls (> 4.0s). Tracks reticle with 2-axis mouse steering (`M<dx>,<dy>`) and looses charged Pyro shots (`LMB_HOLD` 1.6s).
-     - **Combat Lock:** Prevents navigation sweeps and walking until all enemy HP bars are cleared for >= 1.5s.
-     - **Manual Fallback:** After 45s of unresolved combat, alerts the player and yields control.
-   - **State 3 — Chest Looting & Multi-Second Vacuum (`CHEST_LOOT`):**
-     - **High-Confidence Sealed Ring Detection:** Detects only high-saturation glowing crimson (`H: 0..8` / `172..180`, `S: 175..255`, `V: 170..255`) or anemo-teal (`H: 82..98`, `S: 160..255`, `V: 170..255`) circular lock rings in a tighter mid-screen ROI (`x: 300..980, y: 220..560`) with aspect ratio filtering (`0.70..1.35`, area `350..3200 px`). Broad terrain/brown color guessing has been removed to eliminate false positives on Mondstadt dirt paths and rocks.
-     - **Multi-Second Loot Vacuum:** Upon opening a chest or triggering an overworld `[F]` prompt, halts movement (`W0`), waits 0.65s for the chest lid opening animation and scattered drops to hit the ground, and enters a 2.2s–2.8s vacuum burst tapping `F` every 0.16s–0.24s (10–14 taps total) while executing a gentle left/right camera wiggle (`M-18,0` $\rightarrow$ `M36,0` $\rightarrow$ `M-18,0`). Continues draining stacked item drop lists until the `[F]` prompt box is cleared.
-   - **State 4 — Overworld Navigation (`NAVIGATE`):**
-     - **Pure Template-Based Multi-Scale Quest Tracking:** Tracks quest objectives exclusively via `assets/quest_gold.png` and `assets/quest_blue.png` templates, eliminating legacy HSV color guessing. Every 30th frame (`frame_idx % 30 == 0`), runs a full multi-scale search (`scales = [0.85, 1.0, 1.15]`, threshold `>= 0.56`) across `ROI_NAV`, verified by dominant interior hue (`Gold H: 15..42`, `Blue H: 92..126`). On the intermediate 29 frames, tracks within a fast $110 \times 110$ px window around the last detected position ($< 0.1$ ms per frame).
-     - **Stamina & Character Exclusion Zone:** Automatically masks out `x: 520..760, y: 240..540` from quest detection so the curved yellow stamina arc next to Lumine never biases the marker centroid.
-     - **Hard Center Lock:** When the marker is centered ($|error\_x| \le 28$ px), camera steering is strictly zeroed (`dx = 0`) and minimap road bias is suppressed to eliminate post-lock camera drift. Road-following bias is only applied when the marker is distant/off-center ($|error\_x| > 45$ px).
-     - **Lost-Marker Recovery (Pulse 'V' First):** If neither a gold nor blue marker is detected for $> 0.75$s, dispatches `V` (4.5s cooldown) to re-illuminate the navigation trail. Waits 0.9s (total $> 1.65$s); only if the marker remains undetected does it halt walking (`W0`) and begin slow horizontal camera sweeps (`M<dx>`).
-     - **Minimap Road-Following:** Segments dirt roads and paths within the circular minimap, calculating path centerline bearing. Biases movement towards roads when within $\pm 55^\circ$ of quest target.
-     - **Smoothed Camera Steering:** Camera mouse steering uses Exponential Moving Average (EMA, $\alpha=0.35$) with rate limiting (max 15–20 Hz) to eliminate micro-stutter. Proportional steering gain `Kp` (`0.14`) is read directly from `config.json`.
-     - **Hard Turn Pausing:** Stops walking (`W0`) during sharp turns ($|error\_x| > 160$ px) to prevent wide drifting.
-     - **Obstacle Jumping & Unstuck Logic:** Frame differencing on the player feet region detects terrain obstacles. Automatically triggers `SPACE` jump after 1.8s of stall, followed by lateral evasion if stuck persists.
-     - **Overworld [F] Prompt Interaction:** Interacts with Waypoints, Statues, items, and NPCs.
-5. **Firmware TRNG & 12-Second Watchdog:** ESP32-S3 uses true hardware random numbers (`esp_random()`) and a 12-second safety watchdog timer, complemented by 4-second Python navigation keepalive pings.
-6. **Safe OpenCV Window Lifecycle:** All GUI rendering and window calls are guarded with `cv2.getWindowProperty` and `try...except cv2.error` handlers. Closing the debug window with the Windows `X` button terminates cleanly without `NULL window` crashes.
-7. **High-Performance Capture Pipeline:** Computes optical flow / unstuck differencing and sealed-chest ring masks on a downscaled `0.5x` frame (`640x360`), runs unstuck motion checks only every 3rd frame (`frame_idx % 3 == 0`), and throttles `cv2.imshow` GUI rendering to max 20 FPS while the screen capture and non-blocking HID loop execute at full speed.
+1. **Staged Non-Blocking Obstacle Unstuck State Machine:**
+   - Replaced permanent stall lockout with a staged, non-blocking unstuck routine:
+     - **Stage 1 (Stall $\ge 0.8$s):** Pulses `SPACE` jump without stopping forward walking.
+     - **Stage 2 (Stall $\ge 1.7$s):** Halts walking (`W0`), pivots laterally $\pm 70$ counts, resumes forward walking (`W1`), and jumps (`SPACE`), resetting the stall timer.
+2. **Instant Directional Turning via Minimap Quest Bearing:**
+   - Detects both Gold (`H: 18..38, S: 130..255, V: 175..255`) and Blue (`H: 92..124, S: 85..255, V: 165..255`) quest blips inside the circular minimap (`center: (114, 96), r: 68`).
+   - When the 3D marker is off-screen, immediately pivots toward the exact shortest bearing at high turn speed rather than waiting $1.65$s or sweeping blindly.
+3. **Non-Blocking Combat & Amber Aiming Sub-States:**
+   - Replaced all blocking `time.sleep()` calls in combat with non-blocking timestamp sub-states (`AIM_SWAP_WAIT`, `AIM_ENTER_R`, `AIM_TRACK_AND_CHARGE`, `AIM_RELEASE`).
+   - Actively tracks the enemy's moving HP bar with 2-axis mouse steering (`M<dx>,<dy>`) *while* `LMB_HOLD` charges Amber's shot.
+4. **Dialogue Multi-Choice Selection:**
+   - In `STATE_DIALOGUE`, detects speech-bubble option icons in `ROI_CHOICE` and advances multi-choice options with accelerated confirmation cadence.
+5. **False-Positive Quest Rejection (Concentric Contrast Verification):**
+   - Increased template matching threshold to `0.64`.
+   - Requires $\ge 28\%$ of the inner $35\%$ core pixels to match the target quest hue (`Gold H: 16..40`, `Blue H: 92..124`).
+   - Enforces concentric contrast: inner core mean Value ($V_{core}$) must be at least $25$ units brighter than the surrounding border ring ($V_{border}$), rejecting flat sunlit rocks, dirt, and foliage.
+6. **Throttled Full-Screen Scans with Immediate Local Fallback:**
+   - Locked targets use a fast $120 \times 120$ local window every frame; if missed, immediately falls back to a full-ROI scan on that frame.
+   - When unlocked (marker off-screen), full-ROI multi-scale scans are throttled to every 6th frame (`frame_idx % 6 == 0`), sustaining $> 60$ FPS.
+7. **Hollow-Ring Sealed Chest Detection (4-Frame Confirmation):**
+   - Rejects solid red/teal blobs (flowers, barrels, slimes). Enforces fill extent $0.12 \le \text{extent} \le 0.48$ (or inner hole contour via `cv2.RETR_CCOMP`) and requires $\ge 4$ consecutive frames inside `x: 360..920, y: 240..540`.
+8. **Hardened Overworld `[F]` Prompt Detector (3-Frame Confirmation):**
+   - Simultaneously verifies a square bright keycap ($V > 200$, $18 \le bw \le 36$) on the left and a dark translucent pill strip ($V < 95$) containing $\ge 18$ bright white text pixels ($V > 210$) on the right. Requires $\ge 3$ consecutive frames before triggering loot vacuum.
+9. **Two-Zone PD Camera Steering & Pivot-in-Place:**
+   - Firmware micro-stepped mouse movement widened to `[-110, 110]` with $16$-count steps spaced $900\,\mu$s apart.
+   - Python PD controller operates at **28 Hz** ($0.035$s update interval) without pre-PD EMA lag:
+     - **Zone 1 (Deadzone $|error\_x| \le 24$ px):** $dx = 0$, hard center lock.
+     - **Zone 2 (Fine PD $24 < |error\_x| \le 130$ px):** $Kp = 0.26$, $Kd = 0.09$, clamped to $[-45, 45]$.
+     - **Zone 3 (Fast Pivot $|error\_x| > 130$ px):** $Kp = 0.44$, $Kd = 0.10$, clamped to $[-95, 95]$.
+     - **Pivot-in-Place:** Automatically pauses forward walking (`W0`) whenever $|error\_x| > 115$ px or when turning toward an off-screen minimap bearing.
+10. **Safe OpenCV Window Lifecycle:**
+    - Guarded with `cv2.getWindowProperty` and `try...except cv2.error` handlers so clicking the Windows `X` button closes the application safely without crashes.
+11. **Fixed HUD Crosshair Line Typo:**
+    - Corrected vertical crosshair line coordinates to `(mcx, mcy - 16)` $\rightarrow$ `(mcx, mcy + 16)`.
 
 ---
 
-## Project Structure
+## Modular Project Structure
 
 ```
 genshin_cv_hid/
@@ -80,13 +81,17 @@ genshin_cv_hid/
 │   ├── .gitkeep              # Optional templates (minimap_border.png, choice_icon.png)
 │   ├── quest_gold.png        # 28x28 Gold Archon/Story quest diamond template
 │   └── quest_blue.png        # 28x28 Blue World Quest diamond template
-├── config.json               # Persisted Kp gain, EMA alpha, and lost-marker timings
+├── config.json               # Persisted PD gains, thresholds, and timings
 ├── firmware/
 │   └── esp32s3_hid/
-│       └── esp32s3_hid.ino   # Non-blocking TinyUSB HID + CDC Serial sketch (v4)
+│       └── esp32s3_hid.ino   # Non-blocking TinyUSB HID + CDC Serial sketch (v5)
 ├── app/
-│   ├── __init__.py
-│   ├── main.py               # Main CV capture, auto-combat & template tracker
+│   ├── __init__.py           # Package exports
+│   ├── config_manager.py     # Constants, ROIs, defaults, and config I/O
+│   ├── controller.py         # ESP32HIDController + PDSteeringController
+│   ├── vision.py             # VisionDetector (concentric templates, minimap, chest, prompt)
+│   ├── state_machine.py      # AssistantStateMachine (hierarchy, unstuck, non-blocking combat)
+│   ├── main.py               # Application entrypoint, capture loop, HUD rendering
 │   └── test_hid.py           # Standalone serial-to-HID verification utility
 ├── requirements.txt
 └── README.md
@@ -145,8 +150,8 @@ genshin_cv_hid/
 | `W1` | Continuous forward walk | Immediate | Continuous until `W0` or `STOP` |
 | `W0` | Pause forward walk (releases `'w'` only) | Immediate | Instant (decoupled from mouse) |
 | `STOP` | Emergency stop: releases all keys, mouse buttons & queue | Immediate | Instant |
-| `M<dx>` | Smooth horizontal mouse move (max 16 counts/chunk) | Micro-Stepped | Instant (1200us step spacing) |
-| `M<dx>,<dy>` | Smooth 2-axis mouse move (max 16 counts/chunk) | Micro-Stepped | Instant (1200us step spacing) |
+| `M<dx>` | High-speed mouse move (clamped `[-110, 110]`) | Micro-Stepped | Instant (16-count steps, 900us spacing) |
+| `M<dx>,<dy>` | High-speed 2-axis mouse move (clamped `[-110, 110]`) | Micro-Stepped | Instant (16-count steps, 900us spacing) |
 
 ---
 
@@ -233,17 +238,6 @@ python app/main.py --dry-run
 | **`F12`** | Global (Any Window) | **Instant Pause / Resume Toggle**. Immediately releases all held keys (`STOP`), clears queues, and suspends automation. |
 | **`T`** | Debug Window | **Capture Active Diamond Template**. Crops a 28x28 patch around the tracked marker and saves to `assets/quest_gold.png` or `assets/quest_blue.png`. |
 | **Mouse Click** | Debug Window | **Crop Template At Cursor**. Left-click on any quest diamond on the live debug window to instantly save a 28x28 reference template. |
-| **`D`** | Debug Window | **Reset Configuration to Defaults**. Restores hardcoded defaults (`Kp = 0.14`, `threshold = 0.56`, etc.) and updates `config.json`. |
+| **`D`** | Debug Window | **Reset Configuration to Defaults**. Restores hardcoded defaults (`Kp_fine = 0.26`, `Kd = 0.09`, `Kp_fast = 0.44`, `threshold = 0.64`, etc.) and updates `config.json`. |
 | **`S`** | Debug Window | **Save Configuration**. Saves current configuration to `config.json`. |
 | **`Q`** / **`ESC`** | Debug Window | **Clean Shutdown**. Issues emergency `STOP` command to ESP32-S3, closes serial, and destroys OpenCV windows. |
-
----
-
-## Troubleshooting
-
-- **ESP32-S3 Not Detected / No COM Port:**
-  Ensure you are plugged into the **native USB** port on the board. In Windows Device Manager, check under *Ports (COM & LPT)*. If marked with a yellow triangle, reinstall the ESP32 USB CDC driver or press the `BOOT` + `RESET` buttons on the board to enter download mode.
-- **Combat Timing Out at 45s:**
-  If an enemy is shielded or obstructed, the 45s safety cutoff triggers and beeps, allowing manual takeover. Once cleared, the assistant automatically resumes `NAVIGATE`.
-- **Recapturing Quest Templates:**
-  If quest icons look different under custom shaders or display settings, press **`T`** while the marker is on screen, or left-click directly on the diamond in the live debug window to save a fresh 28x28 template.
