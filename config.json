@@ -4,6 +4,8 @@
   "Kp_fast": 0.44,
   "steer_rate_hz": 28,
   "center_lock_deadzone": 24,
+  "cruise_drift_corridor": 95,
+  "default_pitch_up_counts": -30,
   "pivot_error_threshold": 115,
   "road_following_enabled": true,
   "blue_marker_enabled": true,

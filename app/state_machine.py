@@ -66,6 +66,11 @@ class AssistantStateMachine:
         self.last_sprint_time: float = time.time()
         self.next_sprint_interval: float = random.uniform(2.2, 3.8)
 
+        # Camera-Locked Sprint with Hysteresis Drift Corridor
+        self.nav_mode: str = "ALIGN"  # "ALIGN" (stationary centering) or "CRUISE_LOCKED" (forward sprint, dx=0)
+        self.cruise_source: str = "3D"  # "3D" or "MINIMAP"
+        self.needs_pitch_reset: bool = True  # Automatic upward camera pitch reset on entering navigation
+
         # Staged Obstacle Unstuck State Machine (0.8s hop, 1.7s lateral turn + hop)
         self.prev_ground_gray_half: Optional[np.ndarray] = None
         self.smooth_motion_score: float = 10.0
@@ -152,6 +157,8 @@ class AssistantStateMachine:
                 self.is_scanning_for_marker = False
                 self.vacuum_active = False
                 self.vacuum_phase = "IDLE"
+                self.nav_mode = "ALIGN"
+                self.needs_pitch_reset = True
                 self.next_dialogue_f_time = now + dialogue_advance_delay()
                 if self.is_aiming_bow:
                     self.hid.press_r()
@@ -201,6 +208,8 @@ class AssistantStateMachine:
                 self.is_scanning_for_marker = False
                 self.vacuum_active = False
                 self.vacuum_phase = "IDLE"
+                self.nav_mode = "ALIGN"
+                self.needs_pitch_reset = True
                 self.hid.stop_walk()
                 self.hid.stop_all()
                 print(f"[STATE] Entered {STATE_COMBAT_AUTO} (Valid HP bars: {num_bars}, aspect ratio >= 5.5, elevated: {is_elevated})")
@@ -232,6 +241,8 @@ class AssistantStateMachine:
                     self.is_aiming_bow = False
                     self.bow_substate = "AIM_IDLE"
                 self.current_state = STATE_NAVIGATE
+                self.nav_mode = "ALIGN"
+                self.needs_pitch_reset = True
                 self.combat_ended_time = now
                 self.pending_v_pulse_time = now + random.uniform(0.4, 0.8)
 
@@ -256,6 +267,8 @@ class AssistantStateMachine:
         # Require >= 4 consecutive frames to eliminate false chest detours
         if self.sealed_chest_consecutive_frames >= 4 and ring_centroid:
             self.current_state = STATE_CHEST_LOOT
+            self.nav_mode = "ALIGN"
+            self.needs_pitch_reset = True
             self.active_chest_box = ring_box
             cx, cy = ring_centroid
             error_x = cx - 640
@@ -293,6 +306,8 @@ class AssistantStateMachine:
         self.hid.stop_walk()
         self.hid.press_f()
         self.vacuum_active = True
+        self.nav_mode = "ALIGN"
+        self.needs_pitch_reset = True
         self.vacuum_phase = "WAIT_ANIMATION"
         self.vacuum_animation_end_time = now + 0.65
         burst_duration = random.uniform(2.2, 2.8)
@@ -355,6 +370,8 @@ class AssistantStateMachine:
                 self.overworld_f_cooldown = random.uniform(1.4, 2.0)
                 self.f_prompt_consecutive_frames = 0
                 self.current_state = STATE_NAVIGATE
+                self.nav_mode = "ALIGN"
+                self.needs_pitch_reset = True
 
     # ==========================================================================
     # Non-Blocking Starter Combat & Amber Bow Aiming
@@ -501,12 +518,21 @@ class AssistantStateMachine:
         # 1. Transition V pulse from Dialogue
         if not self.previous_minimap_state:
             self.pending_v_pulse_time = now + random.uniform(0.3, 0.6)
+            self.nav_mode = "ALIGN"
+            self.needs_pitch_reset = True
 
         if self.pending_v_pulse_time and now >= self.pending_v_pulse_time:
             self.hid.press_v()
             self.pending_v_pulse_time = None
 
-        # 2. Overworld [F] Prompt Detection (Keycap + Dark Pill Strip)
+        # 2. Camera Pitch Reset for Mondstadt Elevation
+        if self.needs_pitch_reset:
+            pitch_counts = int(self.config.get("default_pitch_up_counts", -30))
+            if pitch_counts != 0:
+                self.hid.move_mouse(0, pitch_counts)
+            self.needs_pitch_reset = False
+
+        # 3. Overworld [F] Prompt Detection (Keycap + Dark Pill Strip)
         f_prompt_detected, prompt_box = self.detector.detect_overworld_f_prompt(frame)
         if f_prompt_detected and prompt_box:
             self.f_prompt_consecutive_frames += 1
@@ -527,6 +553,9 @@ class AssistantStateMachine:
                 if marker_recent and marker_centered:
                     print("[NAV] Arrived at quest target with [F] prompt -> single F tap.")
                     self.hid.press_f()
+                    self.hid.stop_walk()
+                    self.nav_mode = "ALIGN"
+                    self.needs_pitch_reset = True
                     self.last_overworld_f_time = now
                     self.overworld_f_cooldown = 1.2
                     self.show_overworld_f_box_until = now + 1.2
@@ -535,7 +564,7 @@ class AssistantStateMachine:
         else:
             self.f_prompt_consecutive_frames = 0
 
-        # 3. Downscaled Ground Motion Differencing & Staged Unstuck (Every 3rd frame)
+        # 4. Downscaled Ground Motion Differencing & Staged Unstuck (Every 3rd frame)
         if frame_idx % 3 == 0:
             raw_motion, self.prev_ground_gray_half = self.detector.calculate_ground_motion_downscaled(
                 frame_half, self.prev_ground_gray_half
@@ -566,12 +595,12 @@ class AssistantStateMachine:
             self.unstuck_still_start_time = 0.0
             self.unstuck_stage = 0
 
-        # 4. Minimap Quest Bearing & Road Segmentation
+        # 5. Minimap Quest Bearing & Road Segmentation
         quest_bearing, road_bearing, has_road, blip_type = self.detector.analyze_minimap_road_and_quest(frame)
         self.active_road_following = has_road
         self.minimap_quest_bearing = quest_bearing
 
-        # 5. Hybrid Quest Tracking (Template Matching + Direct Diamond HSV & Dark Outline)
+        # 6. Hybrid Quest Tracking (Template Matching + Direct Diamond HSV & Dark Outline)
         centroid, marker_type, bbox, score, scan_mode = self.detector.track_quest_marker(
             frame, self.config, frame_idx, self.last_template_lock
         )
@@ -580,6 +609,9 @@ class AssistantStateMachine:
         self.active_marker_bbox = bbox
         self.active_marker_score = score
         self.active_scan_mode = scan_mode
+
+        deadzone = int(self.config.get("center_lock_deadzone", 24))
+        drift_corridor = int(self.config.get("cruise_drift_corridor", 95))
 
         if centroid is not None:
             self.marker_last_seen_time = now
@@ -596,52 +628,97 @@ class AssistantStateMachine:
             }
             cx, cy = centroid
             raw_error_x = cx - 640
+        else:
+            self.last_template_lock = None
+            cx, cy = None, None
+            raw_error_x = None
 
-            # Subtle road-following bias if marker is distant/off-center
-            if abs(raw_error_x) > 45 and has_road and road_bearing is not None and self.config.get("road_following_enabled", True):
-                road_offset_x = road_bearing * (640.0 / (math.pi / 2.5))
-                effective_error_x = 0.70 * raw_error_x + 0.30 * road_offset_x
+        # ----------------------------------------------------------------------
+        # TWO-STATE HYSTERESIS NAVIGATION: CRUISE_LOCKED vs ALIGN
+        # ----------------------------------------------------------------------
+        if self.nav_mode == "CRUISE_LOCKED":
+            should_exit_cruise = False
+            exit_reason = ""
+
+            if centroid is not None:
+                self.cruise_source = "3D"
+                if abs(raw_error_x) > drift_corridor:
+                    should_exit_cruise = True
+                    exit_reason = f"Drift corridor exceeded (|{raw_error_x}| > {drift_corridor} px)"
             else:
-                effective_error_x = float(raw_error_x)
+                if self.cruise_source == "3D":
+                    if now - self.marker_last_seen_time > 0.65:
+                        should_exit_cruise = True
+                        exit_reason = f"3D marker occluded ({now - self.marker_last_seen_time:.2f}s > 0.65s)"
+                elif self.cruise_source == "MINIMAP":
+                    if quest_bearing is None:
+                        should_exit_cruise = True
+                        exit_reason = "Minimap bearing lost"
+                    elif abs(math.degrees(quest_bearing)) > 35.0:
+                        should_exit_cruise = True
+                        exit_reason = f"Minimap bearing drifted ({abs(math.degrees(quest_bearing)):.1f} deg > 35 deg)"
 
-            # Two-Zone PD Camera Steering
-            dx, should_pause_walk = self.steering.compute_steering(effective_error_x, now)
-            if dx != 0:
-                self.hid.move_mouse(dx, 0)
-
-            if raw_error_x > 20:
-                self.scan_sweep_direction = 1
-            elif raw_error_x < -20:
-                self.scan_sweep_direction = -1
-
-            # Walk arbitration (pause walking during sharp turns |error_x| > 115 px)
-            if should_pause_walk:
-                if self.hid.is_walking:
-                    self.hid.stop_walk()
+            if should_exit_cruise:
+                print(f"[NAV] Exiting CRUISE_LOCKED -> ALIGN: {exit_reason}")
+                self.nav_mode = "ALIGN"
+                self.hid.stop_walk()
+                # Fall through to ALIGN handling below to begin steering immediately
             else:
+                # Maintain forward walk and periodic sprint bursts
                 if not self.hid.is_walking and not self.vacuum_active:
                     self.hid.start_walk()
 
                 if self.hid.is_walking:
-                    # Occasional sprint dodge
                     if now - self.last_sprint_time >= self.next_sprint_interval:
                         self.hid.click_rmb()
                         self.last_sprint_time = now
                         self.next_sprint_interval = random.uniform(2.2, 3.8)
 
-                    # 4.0s keepalive check to prevent firmware watchdog from tripping
                     if now - self.hid.last_command_time >= 4.0:
                         self.hid.send_command("W1")
 
-        else:
-            # 3D Marker off-screen -> Drop local lock
-            self.last_template_lock = None
+                # LOCK OUT ALL CAMERA PANNING (dx = 0): No mouse steering commands sent
+                return
 
-            # ------------------------------------------------------------------
-            # INSTANT DIRECTIONAL TURNING VIA MINIMAP QUEST BEARING
-            # ------------------------------------------------------------------
-            if quest_bearing is not None:
-                # Do NOT overwrite self.marker_last_seen_time = now (keep strictly for 3D locks)
+        # ----------------------------------------------------------------------
+        # MODE A: ALIGN (Stationary Camera Centering)
+        # ----------------------------------------------------------------------
+        if self.nav_mode == "ALIGN":
+            if self.hid.is_walking:
+                self.hid.stop_walk()
+
+            # Case 1: 3D Marker Visible
+            if centroid is not None:
+                if abs(raw_error_x) <= deadzone:
+                    print(f"[NAV] Aligned with 3D marker (|{raw_error_x}| <= {deadzone} px) -> CRUISE_LOCKED")
+                    self.nav_mode = "CRUISE_LOCKED"
+                    self.cruise_source = "3D"
+                    if not self.vacuum_active:
+                        self.hid.start_walk()
+                    return
+
+                # Subtle road-following bias if marker is distant/off-center
+                if abs(raw_error_x) > 45 and has_road and road_bearing is not None and self.config.get("road_following_enabled", True):
+                    road_offset_x = road_bearing * (640.0 / (math.pi / 2.5))
+                    effective_error_x = 0.70 * raw_error_x + 0.30 * road_offset_x
+                else:
+                    effective_error_x = float(raw_error_x)
+
+                dx, _ = self.steering.compute_steering(effective_error_x, now)
+                # Upward pitch step if marker sits near top edge (cy < 175 px)
+                dy = -10 if cy < 175 else 0
+
+                if dx != 0 or dy != 0:
+                    self.hid.move_mouse(dx, dy)
+
+                if raw_error_x > 20:
+                    self.scan_sweep_direction = 1
+                elif raw_error_x < -20:
+                    self.scan_sweep_direction = -1
+                return
+
+            # Case 2: 3D Marker off-screen, Minimap Quest Bearing Present
+            elif quest_bearing is not None:
                 self.is_scanning_for_marker = False
                 self.lost_marker_phase = "IDLE"
                 self.lost_marker_start_time = 0.0
@@ -656,76 +733,62 @@ class AssistantStateMachine:
                     self.last_quest_v_pulse_time = now
                     print(f"[NAV] Quest marker occluded ({time_lost:.2f}s > {v_delay}s): dispatched 'V' pulse.")
 
-                # Calculate instant pivot towards off-screen bearing
-                pivot_dx, should_pause_walk = self.steering.compute_minimap_pivot(quest_bearing, now)
+                bearing_deg = abs(math.degrees(quest_bearing))
+                if bearing_deg <= 20.0:
+                    print(f"[NAV] Aligned with minimap bearing ({bearing_deg:.1f} deg <= 20 deg) -> CRUISE_LOCKED")
+                    self.nav_mode = "CRUISE_LOCKED"
+                    self.cruise_source = "MINIMAP"
+                    if not self.vacuum_active:
+                        self.hid.start_walk()
+                    return
+
+                pivot_dx, _ = self.steering.compute_minimap_pivot(quest_bearing, now)
                 if pivot_dx != 0:
                     self.hid.move_mouse(pivot_dx, 0)
-
-                if should_pause_walk:
-                    if self.hid.is_walking:
-                        self.hid.stop_walk()
-                else:
-                    if not self.hid.is_walking and not self.vacuum_active:
-                        self.hid.start_walk()
-                    if self.hid.is_walking:
-                        if now - self.hid.last_command_time >= 4.0:
-                            self.hid.send_command("W1")
                 return
 
-            # ------------------------------------------------------------------
-            # LOST-MARKER 4-PHASE RECOVERY ROUTINE (NO ENDLESS ROTATION)
-            # 1. Stop camera (dx = 0) and wait 0.8s
-            # 2. Pulse 'V' once (5.0s cooldown) and wait 1.0s completely still (dx=0, W0)
-            # 3. At most 8 discrete step turns (M32,0 every 0.28s, pausing between)
-            # 4. Stop rotating completely (dx=0, W0) and remain idle
-            # ------------------------------------------------------------------
-            if self.hid.is_walking:
-                self.hid.stop_walk()
+            # Case 3: Lost Marker 4-Phase Recovery Routine (No Endless Rotation)
+            else:
+                if self.lost_marker_phase == "IDLE":
+                    self.lost_marker_phase = "WAIT_INITIAL"
+                    self.lost_marker_start_time = now
+                    self.lost_marker_step_count = 0
 
-            if self.lost_marker_phase == "IDLE":
-                self.lost_marker_phase = "WAIT_INITIAL"
-                self.lost_marker_start_time = now
-                self.lost_marker_step_count = 0
+                if self.lost_marker_phase == "WAIT_INITIAL":
+                    if now - self.lost_marker_start_time >= float(self.config.get("lost_marker_v_delay", 0.8)):
+                        v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
+                        if now - self.last_quest_v_pulse_time >= v_cooldown:
+                            self.hid.press_v()
+                            self.last_quest_v_pulse_time = now
+                            print("[NAV] Lost marker: dispatched 'V' pulse.")
+                        self.lost_marker_phase = "WAIT_V_PULSE"
+                        self.lost_marker_start_time = now
 
-            if self.lost_marker_phase == "WAIT_INITIAL":
-                # Phase 1: Wait 0.8s stationary
-                if now - self.lost_marker_start_time >= float(self.config.get("lost_marker_v_delay", 0.8)):
+                elif self.lost_marker_phase == "WAIT_V_PULSE":
+                    if now - self.lost_marker_start_time >= 1.0:
+                        self.lost_marker_phase = "STEP_SWEEP"
+                        self.lost_marker_step_count = 0
+                        self.last_step_sweep_time = now
+
+                elif self.lost_marker_phase == "STEP_SWEEP":
+                    self.is_scanning_for_marker = True
+                    if now - self.last_step_sweep_time >= 0.28:
+                        if self.lost_marker_step_count < 8:
+                            step_dx = 32 * self.scan_sweep_direction
+                            self.hid.move_mouse(step_dx, 0)
+                            self.lost_marker_step_count += 1
+                            self.last_step_sweep_time = now
+                        else:
+                            print(f"[NAV] Completed 8-step scan sweep ({self.lost_marker_step_count}/8). Stopping rotation.")
+                            self.is_scanning_for_marker = False
+                            self.lost_marker_phase = "SWEEP_COMPLETE"
+
+                elif self.lost_marker_phase == "SWEEP_COMPLETE":
+                    self.is_scanning_for_marker = False
                     v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
                     if now - self.last_quest_v_pulse_time >= v_cooldown:
                         self.hid.press_v()
                         self.last_quest_v_pulse_time = now
-                        print(f"[NAV] Lost marker: dispatched 'V' pulse.")
-                    self.lost_marker_phase = "WAIT_V_PULSE"
-                    self.lost_marker_start_time = now
-
-            elif self.lost_marker_phase == "WAIT_V_PULSE":
-                # Phase 2: Wait 1.0s completely still for marker to appear
-                if now - self.lost_marker_start_time >= 1.0:
-                    self.lost_marker_phase = "STEP_SWEEP"
-                    self.lost_marker_step_count = 0
-                    self.last_step_sweep_time = now
-
-            elif self.lost_marker_phase == "STEP_SWEEP":
-                # Phase 3: At most 8 discrete step turns (M32,0 every 0.28s)
-                self.is_scanning_for_marker = True
-                if now - self.last_step_sweep_time >= 0.28:
-                    if self.lost_marker_step_count < 8:
-                        step_dx = 32 * self.scan_sweep_direction
-                        self.hid.move_mouse(step_dx, 0)
-                        self.lost_marker_step_count += 1
-                        self.last_step_sweep_time = now
-                    else:
-                        print(f"[NAV] Completed 8-step scan sweep ({self.lost_marker_step_count}/8). Stopping rotation.")
-                        self.is_scanning_for_marker = False
-                        self.lost_marker_phase = "SWEEP_COMPLETE"
-
-            elif self.lost_marker_phase == "SWEEP_COMPLETE":
-                # Phase 4: Remain completely idle until marker appears or V cooldown expires
-                self.is_scanning_for_marker = False
-                v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
-                if now - self.last_quest_v_pulse_time >= v_cooldown:
-                    self.hid.press_v()
-                    self.last_quest_v_pulse_time = now
-                    print(f"[NAV] V cooldown expired in idle: dispatched 'V' pulse.")
-                    self.lost_marker_phase = "WAIT_V_PULSE"
-                    self.lost_marker_start_time = now
+                        print("[NAV] V cooldown expired in idle: dispatched 'V' pulse.")
+                        self.lost_marker_phase = "WAIT_V_PULSE"
+                        self.lost_marker_start_time = now

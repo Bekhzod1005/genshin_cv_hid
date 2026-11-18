@@ -34,6 +34,27 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
 
 ---
 
+## v5.2 Architecture: Camera-Locked Sprint & Elevation Tracking
+
+1. **Camera-Locked Sprint with Hysteresis Drift Corridor (`ALIGN` vs `CRUISE_LOCKED`):**
+   - **Stationary Alignment (`ALIGN`):** When steering toward a 3D quest diamond or minimap quest bearing, forward walking is paused (`W0`). The camera smoothly steers horizontally toward the objective.
+     - **Vertical Elevation Tilt:** If the 3D marker is elevated near the top edge ($cy < 175$ px), sends upward pitch step $dy = -10$ alongside horizontal adjustments ($M\langle dx\rangle,-10$).
+     - **Center-Lock Acquisition:** Once $|raw\_error\_x| \le 24$ px (or minimap bearing $\le \pm 20^\circ$), immediately transitions to `CRUISE_LOCKED` and engages forward walking (`W1`).
+   - **Zero-Jitter Camera-Locked Sprint (`CRUISE_LOCKED`):**
+     - Forward sprint is maintained (`W1`, periodic `RMB` sprint bursts, 4.0s keepalive).
+     - **All camera panning is completely locked out ($dx = 0$)**: No mouse movement commands are dispatched while cruising, completely eliminating camera shaking, twitching, and zigzagging while running.
+   - **Corridor Hysteresis & Safety Exit:**
+     - The player continues cruising in a straight locked line within a wide **95 px drift corridor**.
+     - If lateral drift exceeds the corridor ($|raw\_error\_x| > 95$ px) or if the 3D marker disappears for $> 0.65$s, the system exits `CRUISE_LOCKED`, halts walking (`W0`), and reverts to stationary `ALIGN` to re-center.
+   - **Clean State Arbitration Reset:** Any state change (`STATE_DIALOGUE`, `STATE_COMBAT_AUTO`, `STATE_CHEST_LOOT`, `F12` pause, or window unfocus) immediately resets `nav_mode` back to `ALIGN` and primes an upward camera pitch reset.
+   - **Status HUD:** Top status bar prominently renders `NAV: ALIGN` (amber) or `NAV: CRUISE LOCKED` (bright green).
+
+2. **Camera Pitch Reset for Mondstadt Elevation:**
+   - **Expanded Navigation ROI:** Extended `ROI_NAV` upper boundary from $y_1 = 100$ to $y_1 = 65$ (`(65, 540, 190, 1090)`) to acquire cliffside and hilltop waypoints earlier.
+   - **Initial Upward Tilt (`default_pitch_up_counts: -30`):** Automatically dispatches an upward camera tilt (`M0,-30`) upon navigation startup or after returning from dialogue, combat, or window pause.
+
+---
+
 ## v5.1 Architecture & Runtime Regression Overhaul
 
 1. **Robust 3D Quest Marker Locking (Hybrid Template + Direct Diamond Fallback):**

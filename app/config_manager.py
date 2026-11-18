@@ -49,7 +49,7 @@ HALF_HEIGHT = 360
 
 # Region of Interest (ROI) Definitions in 1280x720 Space: [y1, y2, x1, x2]
 ROI_MINIMAP = (0, 180, 0, 250)         # Top-Left Minimap
-ROI_NAV = (100, 540, 190, 1090)        # Central Quest Tracking Area
+ROI_NAV = (65, 540, 190, 1090)         # Central Quest Tracking Area (expanded y1: 65 for elevated Mondstadt markers)
 ROI_CHOICE = (320, 560, 700, 1090)     # Middle-Right Dialogue Option Area
 ROI_COMBAT = (120, 560, 160, 1120)     # Enemy Health Bar Area (Excludes sky y < 120 & HUD y > 560)
 ROI_INTERACT = (300, 490, 735, 960)    # Overworld [F] Prompt Area
@@ -84,6 +84,8 @@ HARDCODED_DEFAULTS = {
     "Kp_fast": 0.44,
     "steer_rate_hz": 28,
     "center_lock_deadzone": 24,
+    "cruise_drift_corridor": 95,
+    "default_pitch_up_counts": -30,
     "pivot_error_threshold": 115,
     "road_following_enabled": True,
     "blue_marker_enabled": True,

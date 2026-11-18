@@ -312,6 +312,8 @@ class GenshinAssistantApp:
                         self.sm.f_prompt_consecutive_frames = 0
                         self.sm.vacuum_active = False
                         self.sm.vacuum_phase = "IDLE"
+                        self.sm.nav_mode = "ALIGN"
+                        self.sm.needs_pitch_reset = True
                         if self.sm.is_aiming_bow:
                             self.hid.press_r()
                             self.sm.is_aiming_bow = False
@@ -552,16 +554,17 @@ class GenshinAssistantApp:
                 vac_text = "Approaching Sealed Chest..."
             cv2.putText(debug_frame, vac_text, (320, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 165, 255), 2)
         else:
+            nav_mode_str = "NAV: CRUISE LOCKED" if getattr(self.sm, "nav_mode", "ALIGN") == "CRUISE_LOCKED" else "NAV: ALIGN"
+            nav_mode_color = (0, 255, 0) if getattr(self.sm, "nav_mode", "ALIGN") == "CRUISE_LOCKED" else (0, 215, 255)
             walk_label = "WALK [W1]" if self.hid.is_walking else "IDLE"
-            walk_color = (0, 255, 0) if self.hid.is_walking else (160, 160, 160)
-            cv2.putText(debug_frame, f"Input: {walk_label}", (320, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52, walk_color, 2)
+            cv2.putText(debug_frame, f"{nav_mode_str} | {walk_label}", (270, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, nav_mode_color, 2)
 
             focus_label = "FOCUSED" if is_focused else "UNFOCUSED"
             focus_color = (0, 255, 0) if is_focused else (0, 0, 255)
-            cv2.putText(debug_frame, f"Focus: {focus_label}", (530, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52, focus_color, 2)
+            cv2.putText(debug_frame, f"Focus: {focus_label}", (590, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, focus_color, 2)
 
             mode_label = "DRY-RUN" if self.hid.dry_run else f"HID ({self.port})"
-            cv2.putText(debug_frame, f"Mode: {mode_label}", (740, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1)
+            cv2.putText(debug_frame, f"Mode: {mode_label}", (770, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
 
         cv2.putText(debug_frame, f"FPS: {fps:.1f}", (1160, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
