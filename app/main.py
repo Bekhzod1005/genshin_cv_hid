@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """
-Genshin Impact Hardware-Assisted Computer Vision Automation (v3.3 Concentric Quest)
-=================================================================================
+Genshin Impact Hardware-Assisted Computer Vision Automation (v3.4 Production)
+===========================================================================
 Architecture:
 - Screen Capture: mss (direct desktop / client-rect capture normalized to 1280x720)
 - Hardware Input: ESP32-S3 Microcontroller running TinyUSB HID Keyboard & 2-Axis Mouse
 - Strict State Hierarchy:
     1. DIALOGUE      : Minimap hidden -> Strict top priority, halts all combat/movement/loot,
                        runs natural log-normal dialogue & choice progression.
-    2. COMBAT_AUTO   : Red HP bar detected -> Instant W0 halt (no sprinting past enemies),
-                       humanized paced combat (3-hit combo, 6.5-8.5s E, 12-15s Q, 7-10s swap),
-                       dynamic party size (1-4 slots), and Amber Aim-Shot mode for elevated/stalled targets.
+    2. COMBAT_AUTO   : Strict Horizontal HP-Bar Geometry Filtering inside x: 160..1120, y: 120..560:
+                       - Crimson red (H: 0..5 / 175..180, S: 185..255, V: 175..255)
+                       - Width: 34..140 px, Height: 3..10 px, Aspect Ratio >= 5.5, Extent >= 0.65
+                       - Requires >= 2 consecutive frames before entering combat (rejects sunset skies & torches)
+                       - Paced combat rotation, party-size awareness, and Amber Aim-Shot mode for elevated targets.
     3. CHEST_LOOT    : High-confidence sealed chest ring or overworld [F] loot trigger ->
                        halts movement (W0), opens chest, waits 0.65s lid animation, enters 2.2-2.8s
                        multi-tap [F] vacuum burst with left/right camera wiggle, and drains stacked loot drops.
-    4. NAVIGATE      : Hybrid Multi-Scale Template + Concentric HSV Quest Detection for:
-                       - Gold Quest Diamond (Archon/Story): H: 18..38, S: 140..255, V: 180..255
-                       - Blue World Quest Diamond: Concentric Slate-Blue Ring (H: 96..122, S: 65..220, V: 120..255)
-                         + Dark Navy/Charcoal Border (V < 145) + Glowing Cyan Core (H: 85..112, S: 40..170, V: 215..255)
+    4. NAVIGATE      : 30-Frame Multi-Scale Template Scan + Fast 110x110 Local ROI Tracking:
+                       - Auto-loads user PNG templates (assets/quest_gold.png & assets/quest_blue.png)
+                       - Full-screen scan every 30th frame (scales: [0.85, 1.0, 1.15], threshold >= 0.58)
+                       - Fast 110x110 px local tracking on intermediate frames (60+ FPS steering)
+                       - Interior dominant hue verification (Gold H: 15..42, Blue H: 92..126)
                        - Stamina/Player exclusion zone masking (x: 520..760, y: 240..540)
-                       - Hard Center Lock (abs(error_x) <= 28px zeroes steering & disables road bias)
+                       - Hard Center Lock (abs(error_x) <= 28px zeroes steering & suppresses road bias)
                        - Lost-Marker recovery (pulses 'V' after >0.75s, sweeps after >1.65s)
 - Safety & Hotkeys:
     - [F12] : Global Pause / Resume Toggle
@@ -86,7 +89,7 @@ HALF_HEIGHT = 360
 ROI_MINIMAP = (0, 180, 0, 250)         # Top-Left Minimap
 ROI_NAV = (100, 540, 190, 1090)        # Central Gold/Blue Quest Marker Tracking Area
 ROI_CHOICE = (320, 560, 700, 1090)     # Middle-Right Dialogue Option Area
-ROI_COMBAT = (36, 360, 100, 1180)      # Upper/Middle Enemy Health Bar Area
+ROI_COMBAT = (120, 560, 160, 1120)     # Enemy Health Bar Area (Excludes sky y < 120 & HUD y > 560)
 ROI_INTERACT = (300, 490, 740, 940)    # Overworld [F] Prompt Area
 ROI_PARTY = (170, 470, 1130, 1260)     # Right-Hand Party Portrait Stack
 
@@ -113,7 +116,7 @@ STATE_CHEST_LOOT = "CHEST_LOOT"
 STATE_NAVIGATE = "NAVIGATE"
 
 # ==============================================================================
-# Hardcoded Calibrated In-Game Icon Defaults
+# Hardcoded Calibrated Defaults
 # ==============================================================================
 HARDCODED_DEFAULTS = {
     # Gold Quest Diamond (Archon/Story)
@@ -123,7 +126,7 @@ HARDCODED_DEFAULTS = {
     "S_max": 255,
     "V_min": 180,
     "V_max": 255,
-    # Blue World Quest Diamond (Concentric Slate-Blue Ring + Bright Cyan Core)
+    # Blue World Quest Diamond
     "Blue_H_min": 96,
     "Blue_H_max": 122,
     "Blue_S_min": 65,
@@ -464,7 +467,9 @@ class VisionDetector:
         self.minimap_template = None
         self.choice_template = None
         self.quest_gold_template = None
+        self.quest_gold_template_gray = None
         self.quest_blue_template = None
+        self.quest_blue_template_gray = None
         self.reload_templates()
 
         # Precompute circular minimap mask for road & quest extraction
@@ -472,7 +477,7 @@ class VisionDetector:
         cv2.circle(self.minimap_circle_mask, MINIMAP_CENTER, MINIMAP_RADIUS, 255, -1)
 
     def reload_templates(self):
-        """Load or reload all PNG templates from disk."""
+        """Load user PNG templates directly from disk without overwriting them."""
         if os.path.exists(MINIMAP_TEMPLATE_PATH):
             tmpl = cv2.imread(MINIMAP_TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
             if tmpl is not None:
@@ -484,16 +489,18 @@ class VisionDetector:
                 self.choice_template = tmpl
 
         if os.path.exists(QUEST_GOLD_TEMPLATE_PATH):
-            tmpl = cv2.imread(QUEST_GOLD_TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
+            tmpl = cv2.imread(QUEST_GOLD_TEMPLATE_PATH, cv2.IMREAD_COLOR)
             if tmpl is not None:
                 self.quest_gold_template = tmpl
-                print(f"[VISION] Loaded Gold Quest template from {QUEST_GOLD_TEMPLATE_PATH}")
+                self.quest_gold_template_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
+                print(f"[VISION] Loaded Gold Quest template ({tmpl.shape[1]}x{tmpl.shape[0]}) from {QUEST_GOLD_TEMPLATE_PATH}")
 
         if os.path.exists(QUEST_BLUE_TEMPLATE_PATH):
-            tmpl = cv2.imread(QUEST_BLUE_TEMPLATE_PATH, cv2.IMREAD_GRAYSCALE)
+            tmpl = cv2.imread(QUEST_BLUE_TEMPLATE_PATH, cv2.IMREAD_COLOR)
             if tmpl is not None:
                 self.quest_blue_template = tmpl
-                print(f"[VISION] Loaded Blue Quest template from {QUEST_BLUE_TEMPLATE_PATH}")
+                self.quest_blue_template_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
+                print(f"[VISION] Loaded Blue Quest template ({tmpl.shape[1]}x{tmpl.shape[0]}) from {QUEST_BLUE_TEMPLATE_PATH}")
 
     def check_minimap_present(self, frame_bgr: np.ndarray) -> Tuple[bool, float]:
         """State 1 trigger: Detect presence of minimap UI."""
@@ -614,40 +621,63 @@ class VisionDetector:
 
     def detect_combat_red_hp_bars(
         self, frame_bgr: np.ndarray
-    ) -> Tuple[bool, int, float, Optional[Tuple[int, int]], bool]:
-        """Combat trigger: Detect enemy red HP bars in upper/middle screen (y: 36..360)."""
+    ) -> Tuple[bool, int, float, Optional[Tuple[int, int]], bool, Optional[Tuple[int, int, int, int]]]:
+        """
+        Combat trigger: Strict horizontal HP-bar geometry filtering inside x: 160..1120, y: 120..560.
+        Excludes the top sky strip (y < 120) and bottom HUD (y > 560).
+        
+        Filtering criteria:
+        - Tight crimson red: H: 0..5 or 175..180, S: 185..255, V: 175..255
+        - Width: 34..140 px
+        - Height: 3..10 px
+        - Aspect Ratio: width / height >= 5.5
+        - Rectangular Fill Extent: area / (width * height) >= 0.65
+        
+        Rejects sunset skies, torches, lanterns, and wide sky gradients completely!
+        Returns: (has_valid_bar, num_bars, largest_area, target_centroid, is_elevated, best_bbox)
+        """
         y1, y2, x1, x2 = ROI_COMBAT
         roi = frame_bgr[y1:y2, x1:x2]
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-        mask1 = cv2.inRange(hsv, np.array([0, 150, 140]), np.array([10, 255, 255]))
-        mask2 = cv2.inRange(hsv, np.array([170, 150, 140]), np.array([179, 255, 255]))
+        mask1 = cv2.inRange(hsv, np.array([0, 185, 175]), np.array([5, 255, 255]))
+        mask2 = cv2.inRange(hsv, np.array([175, 185, 175]), np.array([180, 255, 255]))
         red_mask = cv2.bitwise_or(mask1, mask2)
 
-        bar_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 2))
+        bar_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 2))
         filtered = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, bar_kernel)
-        pixel_count = int(cv2.countNonZero(filtered))
 
-        largest_area = 0.0
-        target_centroid = None
-        is_elevated = False
+        contours, _ = cv2.findContours(filtered, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        valid_bars = []
 
-        if pixel_count >= 130:
-            contours, _ = cv2.findContours(filtered, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for c in contours:
-                area = cv2.contourArea(c)
-                if area > largest_area:
-                    largest_area = area
-                    M = cv2.moments(c)
-                    if M["m00"] > 0:
-                        cx = int(M["m10"] / M["m00"]) + x1
-                        cy = int(M["m01"] / M["m00"]) + y1
-                        target_centroid = (cx, cy)
-                        if cy < 290:
-                            is_elevated = True
+        for c in contours:
+            area = cv2.contourArea(c)
+            bx, by, bw, bh = cv2.boundingRect(c)
 
-        in_combat = pixel_count >= 130
-        return in_combat, pixel_count, largest_area, target_centroid, is_elevated
+            # Strict horizontal thin-bar geometry
+            if 34 <= bw <= 140 and 3 <= bh <= 10:
+                aspect_ratio = float(bw) / float(bh)
+                if aspect_ratio >= 5.5:
+                    extent = float(area) / float(bw * bh)
+                    if extent >= 0.65:
+                        cx = x1 + bx + bw // 2
+                        cy = y1 + by + bh // 2
+                        valid_bars.append({
+                            "bbox": (x1 + bx, y1 + by, bw, bh),
+                            "centroid": (cx, cy),
+                            "area": area,
+                            "width": bw,
+                            "height": bh,
+                            "is_elevated": (cy < 290),
+                        })
+
+        if not valid_bars:
+            return False, 0, 0.0, None, False, None
+
+        # Sort valid bars by area/width descending
+        valid_bars.sort(key=lambda b: (b["width"], b["area"]), reverse=True)
+        best = valid_bars[0]
+        return True, len(valid_bars), float(best["area"]), best["centroid"], best["is_elevated"], best["bbox"]
 
     def detect_sealed_chest_ring(
         self, frame_half: np.ndarray
@@ -750,116 +780,171 @@ class VisionDetector:
 
         return quest_bearing, road_bearing, has_road
 
+    def _verify_template_hue(self, patch_bgr: np.ndarray, expected_type: str) -> bool:
+        """Verify that the interior of a template match candidate matches the expected dominant hue."""
+        if patch_bgr.size == 0 or patch_bgr.shape[0] < 6 or patch_bgr.shape[1] < 6:
+            return False
+        ph, pw = patch_bgr.shape[:2]
+        core = patch_bgr[ph // 4 : 3 * ph // 4, pw // 4 : 3 * pw // 4]
+        hsv_core = cv2.cvtColor(core, cv2.COLOR_BGR2HSV)
+        if expected_type == "GOLD":
+            # Gold: H: 15..42
+            mask = cv2.inRange(hsv_core, np.array([15, 90, 130]), np.array([42, 255, 255]))
+            return cv2.countNonZero(mask) >= 6
+        elif expected_type == "BLUE":
+            # Blue: H: 92..126
+            mask = cv2.inRange(hsv_core, np.array([92, 45, 110]), np.array([126, 255, 255]))
+            return cv2.countNonZero(mask) >= 6
+        return False
+
     def track_quest_marker(
-        self, frame_bgr: np.ndarray, tuner_cfg: Dict[str, Any]
-    ) -> Tuple[Optional[Tuple[int, int]], Optional[str], np.ndarray, Optional[Tuple[int, int, int, int]]]:
+        self,
+        frame_bgr: np.ndarray,
+        tuner_cfg: Dict[str, Any],
+        frame_idx: int,
+        last_lock: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Tuple[int, int]], Optional[str], np.ndarray, Optional[Tuple[int, int, int, int]], float, str]:
         """
-        Hybrid Template + Calibrated Concentric HSV Quest Marker Detector:
-        1. Gold Quest Diamond (Archon/Story):
-           - Hue: 18..38, Saturation: 140..255, Value: 180..255.
-        2. Blue World Quest Diamond (World/Commission):
-           - Concentric Slate-Blue Outer Ring: H: 96..122, S: 65..220, V: 120..255
-           - Dark Charcoal/Navy Border Ring: V < 145
-           - Glowing Light-Cyan Core (center 35%): H: 85..112, S: 40..170, V: 215..255
+        Hybrid 30-Frame Multi-Scale Template Scan + Fast 110x110 Local Tracking:
+        - Every 30th frame (or when no lock): full-screen multi-scale template scan across ROI_NAV.
+        - On 29 intermediate frames: fast 110x110 local search around last locked position (60+ FPS).
+        - Interior dominant hue verification (Gold H: 15..42, Blue H: 92..126).
+        - Stamina/Player exclusion zone masking (x: 520..760, y: 240..540).
+        - Concentric HSV contour matching fallback.
         
-        Guards:
-        - Masks out central character & stamina exclusion zone (x: 520..760, y: 240..540).
-        - Rejects blue sky/water false positives (> 50% blue pixels in surrounding 48x48 box).
-        - Multi-scale template matching (threshold >= 0.55; >= 0.48 with concentric core check).
-        
-        Returns: (centroid (cx, cy), marker_type ("GOLD" | "BLUE"), display_mask, bbox (x, y, w, h))
+        Returns: (centroid, marker_type, display_mask, bbox, score, scan_mode_label)
         """
         y1, y2, x1, x2 = ROI_NAV
         roi = frame_bgr[y1:y2, x1:x2]
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        gray_full = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
-        # 1. Gold Mask (Archon / Story quests)
-        lower_gold = np.array([tuner_cfg.get("H_min", 18), tuner_cfg.get("S_min", 140), tuner_cfg.get("V_min", 180)], dtype=np.uint8)
-        upper_gold = np.array([tuner_cfg.get("H_max", 38), tuner_cfg.get("S_max", 255), tuner_cfg.get("V_max", 255)], dtype=np.uint8)
-        gold_mask = cv2.inRange(hsv_roi, lower_gold, upper_gold)
-
-        # 2. Blue Outer Ring Mask (World / Commission quests: H: 96..122, S: 65..220, V: 120..255)
-        lower_blue = np.array([tuner_cfg.get("Blue_H_min", 96), tuner_cfg.get("Blue_S_min", 65), tuner_cfg.get("Blue_V_min", 120)], dtype=np.uint8)
-        upper_blue = np.array([tuner_cfg.get("Blue_H_max", 122), tuner_cfg.get("Blue_S_max", 220), tuner_cfg.get("Blue_V_max", 255)], dtype=np.uint8)
-        blue_mask = cv2.inRange(hsv_roi, lower_blue, upper_blue)
-
-        # 3. MASK OUT STAMINA BAR & CHARACTER EXCLUSION ZONE
-        # In 1280x720: x: 520..760, y: 240..540
+        # Exclusion zone bounds relative to ROI_NAV
         ey1 = max(0, 240 - y1)
         ey2 = min(roi.shape[0], 540 - y1)
         ex1 = max(0, 520 - x1)
         ex2 = min(roi.shape[1], 760 - x1)
+
+        # HSV Masks for fallback & tuner preview
+        lower_gold = np.array([tuner_cfg.get("H_min", 18), tuner_cfg.get("S_min", 140), tuner_cfg.get("V_min", 180)], dtype=np.uint8)
+        upper_gold = np.array([tuner_cfg.get("H_max", 38), tuner_cfg.get("S_max", 255), tuner_cfg.get("V_max", 255)], dtype=np.uint8)
+        gold_mask = cv2.inRange(hsv_roi, lower_gold, upper_gold)
+
+        lower_blue = np.array([tuner_cfg.get("Blue_H_min", 96), tuner_cfg.get("Blue_S_min", 65), tuner_cfg.get("Blue_V_min", 120)], dtype=np.uint8)
+        upper_blue = np.array([tuner_cfg.get("Blue_H_max", 122), tuner_cfg.get("Blue_S_max", 220), tuner_cfg.get("Blue_V_max", 255)], dtype=np.uint8)
+        blue_mask = cv2.inRange(hsv_roi, lower_blue, upper_blue)
+
         gold_mask[ey1:ey2, ex1:ex2] = 0
         blue_mask[ey1:ey2, ex1:ex2] = 0
 
-        # Morphological clean
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         gold_mask = cv2.morphologyEx(gold_mask, cv2.MORPH_OPEN, kernel)
         blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, kernel)
-
         display_mask = cv2.bitwise_or(gold_mask, blue_mask)
 
-        candidates: List[Dict[str, Any]] = []
+        is_30f_scan = (frame_idx % 30 == 0) or (last_lock is None)
 
-        # 4. Multi-Scale Template Matching for Gold
-        if self.quest_gold_template is not None:
-            for scale in (0.85, 1.0, 1.15):
-                tw = int(self.quest_gold_template.shape[1] * scale)
-                th = int(self.quest_gold_template.shape[0] * scale)
-                if tw < 8 or th < 8 or tw >= roi.shape[1] or th >= roi.shape[0]:
-                    continue
-                scaled_tmpl = cv2.resize(self.quest_gold_template, (tw, th))
-                res = cv2.matchTemplate(gray_roi, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
-                res[ey1:ey2, ex1:ex2] = -1.0
-                _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                if max_val >= 0.58:
-                    tx, ty = max_loc
-                    tcx = x1 + tx + tw // 2
-                    tcy = y1 + ty + th // 2
-                    patch_hsv = hsv_roi[ty : ty + th, tx : tx + tw]
-                    if patch_hsv.size > 0:
-                        gold_pts = cv2.inRange(patch_hsv, lower_gold, upper_gold)
-                        if cv2.countNonZero(gold_pts) >= 10:
-                            candidates.append({
+        # ----------------------------------------------------------------------
+        # FAST 110x110 LOCAL SEARCH ON INTERMEDIATE FRAMES (frame_idx % 30 != 0)
+        # ----------------------------------------------------------------------
+        if not is_30f_scan and last_lock is not None and last_lock.get("centroid") is not None:
+            last_cx, last_cy = last_lock["centroid"]
+            last_type = last_lock.get("type", "GOLD")
+            tmpl_gray = self.quest_gold_template_gray if last_type == "GOLD" else self.quest_blue_template_gray
+
+            if tmpl_gray is not None:
+                tw, th = tmpl_gray.shape[1], tmpl_gray.shape[0]
+                # 110x110 local window
+                half_win = 55
+                ly1 = max(100, last_cy - half_win)
+                ly2 = min(540, last_cy + half_win)
+                lx1 = max(190, last_cx - half_win)
+                lx2 = min(1090, last_cx + half_win)
+
+                if (ly2 - ly1) > th and (lx2 - lx1) > tw:
+                    local_gray = gray_full[ly1:ly2, lx1:lx2]
+                    res = cv2.matchTemplate(local_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+                    if max_val >= 0.55:
+                        tx, ty = max_loc
+                        tcx = lx1 + tx + tw // 2
+                        tcy = ly1 + ty + th // 2
+                        patch = frame_bgr[ly1 + ty : ly1 + ty + th, lx1 + tx : lx1 + tx + tw]
+                        if self._verify_template_hue(patch, last_type):
+                            if last_type == "GOLD" or not self._is_sky_or_water_background(frame_bgr, tcx, tcy):
+                                return (tcx, tcy), last_type, display_mask, (lx1 + tx, ly1 + ty, tw, th), float(max_val), "Track: 110x110"
+
+        # ----------------------------------------------------------------------
+        # 30-FRAME FULL SCAN (OR FIRST SCAN): MULTI-SCALE MATCHING (scales: 0.85, 1.0, 1.15)
+        # ----------------------------------------------------------------------
+        template_candidates: List[Dict[str, Any]] = []
+
+        if is_30f_scan:
+            # 1. Gold Template Multi-Scale Scan
+            if self.quest_gold_template_gray is not None:
+                for scale in (0.85, 1.0, 1.15):
+                    tw = int(self.quest_gold_template_gray.shape[1] * scale)
+                    th = int(self.quest_gold_template_gray.shape[0] * scale)
+                    if tw < 8 or th < 8 or tw >= roi.shape[1] or th >= roi.shape[0]:
+                        continue
+                    scaled_tmpl = cv2.resize(self.quest_gold_template_gray, (tw, th))
+                    res = cv2.matchTemplate(gray_roi, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
+                    res[ey1:ey2, ex1:ex2] = -1.0
+                    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                    if max_val >= 0.58:
+                        tx, ty = max_loc
+                        tcx = x1 + tx + tw // 2
+                        tcy = y1 + ty + th // 2
+                        patch = roi[ty : ty + th, tx : tx + tw]
+                        if self._verify_template_hue(patch, "GOLD"):
+                            template_candidates.append({
                                 "type": "GOLD",
-                                "score": float(max_val) + 0.40,
+                                "score": float(max_val),
                                 "centroid": (tcx, tcy),
                                 "bbox": (x1 + tx, y1 + ty, tw, th),
+                                "scan_mode": "Scan: 30f",
                             })
                             break
 
-        # 5. Multi-Scale Template Matching for Concentric Blue World Quest Diamond
-        if self.quest_blue_template is not None:
-            for scale in (0.85, 1.0, 1.15):
-                tw = int(self.quest_blue_template.shape[1] * scale)
-                th = int(self.quest_blue_template.shape[0] * scale)
-                if tw < 8 or th < 8 or tw >= roi.shape[1] or th >= roi.shape[0]:
-                    continue
-                scaled_tmpl = cv2.resize(self.quest_blue_template, (tw, th))
-                res = cv2.matchTemplate(gray_roi, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
-                res[ey1:ey2, ex1:ex2] = -1.0
-                _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            # 2. Blue Template Multi-Scale Scan
+            if self.quest_blue_template_gray is not None:
+                for scale in (0.85, 1.0, 1.15):
+                    tw = int(self.quest_blue_template_gray.shape[1] * scale)
+                    th = int(self.quest_blue_template_gray.shape[0] * scale)
+                    if tw < 8 or th < 8 or tw >= roi.shape[1] or th >= roi.shape[0]:
+                        continue
+                    scaled_tmpl = cv2.resize(self.quest_blue_template_gray, (tw, th))
+                    res = cv2.matchTemplate(gray_roi, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
+                    res[ey1:ey2, ex1:ex2] = -1.0
+                    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                    if max_val >= 0.58:
+                        tx, ty = max_loc
+                        tcx = x1 + tx + tw // 2
+                        tcy = y1 + ty + th // 2
+                        patch = roi[ty : ty + th, tx : tx + tw]
+                        if self._verify_template_hue(patch, "BLUE") and not self._is_sky_or_water_background(frame_bgr, tcx, tcy):
+                            template_candidates.append({
+                                "type": "BLUE",
+                                "score": float(max_val),
+                                "centroid": (tcx, tcy),
+                                "bbox": (x1 + tx, y1 + ty, tw, th),
+                                "scan_mode": "Scan: 30f",
+                            })
+                            break
 
-                tx, ty = max_loc
-                tcx = x1 + tx + tw // 2
-                tcy = y1 + ty + th // 2
+        if template_candidates:
+            template_candidates.sort(key=lambda item: (1 if item["type"] == "GOLD" else 0, item["score"]), reverse=True)
+            best = template_candidates[0]
+            return best["centroid"], best["type"], display_mask, best["bbox"], best["score"], best["scan_mode"]
 
-                # Verify Concentric Signature: Dark Border -> Slate-Blue Ring -> Cyan Core
-                patch_bgr = roi[ty : ty + th, tx : tx + tw]
-                is_concentric, concentric_score = self._verify_blue_diamond_concentric(patch_bgr)
+        # ----------------------------------------------------------------------
+        # COMPLEMENTARY CONCENTRIC HSV CONTOUR DETECTION (FALLBACK)
+        # ----------------------------------------------------------------------
+        hsv_candidates: List[Dict[str, Any]] = []
 
-                # Accept if template score >= 0.55 OR (>= 0.48 with concentric core confirmation)
-                if (max_val >= 0.55 or (max_val >= 0.48 and is_concentric)) and not self._is_sky_or_water_background(frame_bgr, tcx, tcy):
-                    candidates.append({
-                        "type": "BLUE",
-                        "score": float(max_val) + (0.35 if is_concentric else 0.15),
-                        "centroid": (tcx, tcy),
-                        "bbox": (x1 + tx, y1 + ty, tw, th),
-                    })
-                    break
-
-        # 6. Fallback/Complementary Concentric HSV Contour Matching (Blue)
+        # Concentric Blue Diamond check
         b_contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in b_contours:
             area = cv2.contourArea(c)
@@ -875,14 +960,15 @@ class VisionDetector:
                             patch_bgr = roi[by : by + bh, bx : bx + bw]
                             is_concentric, concentric_score = self._verify_blue_diamond_concentric(patch_bgr)
                             if is_concentric and not self._is_sky_or_water_background(frame_bgr, cx, cy):
-                                candidates.append({
+                                hsv_candidates.append({
                                     "type": "BLUE",
-                                    "score": concentric_score + (area / 100.0) * 0.30,
+                                    "score": concentric_score,
                                     "centroid": (cx, cy),
                                     "bbox": (x1 + bx, y1 + by, bw, bh),
+                                    "scan_mode": "HSV Contour",
                                 })
 
-        # 7. Fallback/Complementary HSV Contour Matching (Gold)
+        # Gold Diamond check
         g_contours, _ = cv2.findContours(gold_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in g_contours:
             area = cv2.contourArea(c)
@@ -895,29 +981,23 @@ class VisionDetector:
                         if M["m00"] > 0:
                             cx = int(M["m10"] / M["m00"]) + x1
                             cy = int(M["m01"] / M["m00"]) + y1
-                            candidates.append({
+                            hsv_candidates.append({
                                 "type": "GOLD",
-                                "score": area / 100.0,
+                                "score": float(area / 100.0),
                                 "centroid": (cx, cy),
                                 "bbox": (x1 + bx, y1 + by, bw, bh),
+                                "scan_mode": "HSV Contour",
                             })
 
-        if not candidates:
-            return None, None, display_mask, None
+        if hsv_candidates:
+            hsv_candidates.sort(key=lambda item: (1 if item["type"] == "GOLD" else 0, item["score"]), reverse=True)
+            best = hsv_candidates[0]
+            return best["centroid"], best["type"], display_mask, best["bbox"], best["score"], best["scan_mode"]
 
-        # Sort candidates: Gold prioritized, then highest score
-        candidates.sort(key=lambda item: (1 if item["type"] == "GOLD" else 0, item["score"]), reverse=True)
-        best = candidates[0]
-        return best["centroid"], best["type"], display_mask, best["bbox"]
+        return None, None, display_mask, None, 0.0, "None"
 
     def _verify_blue_diamond_concentric(self, patch_bgr: np.ndarray) -> Tuple[bool, float]:
-        """
-        Verifies the real in-game Genshin Blue World Quest concentric diamond structure:
-        1. Outer/Mid Slate-Blue Ring: H: 96..122, S: 65..220, V: 120..255
-        2. Dark Navy/Charcoal Border Ring: outer pixels with V < 145
-        3. Glowing Light-Cyan Core: center 35% contains H: 85..112, S: 40..170, V: 215..255
-        Returns: (is_valid, confidence_score)
-        """
+        """Verifies concentric slate-blue outer ring + dark navy border + light-cyan core."""
         if patch_bgr.shape[0] < 8 or patch_bgr.shape[1] < 8:
             return False, 0.0
 
@@ -949,7 +1029,6 @@ class VisionDetector:
             score = 0.55 + (blue_ring_count / float(ph * pw)) * 0.45
             return True, score
 
-        # If it has strong blue ring and at least dark border or cyan core
         if (has_cyan_core or has_dark_border) and blue_ring_count >= 10:
             score = 0.40 + (blue_ring_count / float(ph * pw)) * 0.40
             return True, score
@@ -957,10 +1036,7 @@ class VisionDetector:
         return False, 0.0
 
     def _is_sky_or_water_background(self, frame_bgr: np.ndarray, cx: int, cy: int) -> bool:
-        """
-        Sky & Water Rejection: Inspect surrounding 48x48 box centered at (cx, cy).
-        If surrounding pixels are > 50% blue (sky / water / river reflection), reject!
-        """
+        """Sky & Water Rejection: Inspect surrounding 48x48 box. Reject if > 50% blue."""
         sy1 = max(0, cy - 24)
         sy2 = min(TARGET_HEIGHT, cy + 24)
         sx1 = max(0, cx - 24)
@@ -1013,6 +1089,9 @@ class GenshinAssistant:
         self.active_marker_type: Optional[str] = None
         self.active_marker_centroid: Optional[Tuple[int, int]] = None
         self.active_marker_bbox: Optional[Tuple[int, int, int, int]] = None
+        self.active_marker_score: float = 0.0
+        self.active_scan_mode: str = "None"
+        self.last_template_lock: Optional[Dict[str, Any]] = None
 
         # Camera Smoothing (EMA) & Rate Limiter
         self.ema_error_x: float = 0.0
@@ -1065,7 +1144,9 @@ class GenshinAssistant:
         # Dialogue Skipping
         self.next_dialogue_f_time: float = 0.0
 
-        # Deliberate, Paced Auto-Combat System
+        # Strict Enemy HP Bar Geometry Combat Detection
+        self.combat_consecutive_frames: int = 0
+        self.detected_hp_bar_box: Optional[Tuple[int, int, int, int]] = None
         self.combat_start_time = 0.0
         self.combat_clear_start = 0.0
         self.combat_step_ready_time = 0.0
@@ -1111,6 +1192,7 @@ class GenshinAssistant:
                 if self.global_paused:
                     self.hid.stop_all()
                     self.f_prompt_consecutive_frames = 0
+                    self.combat_consecutive_frames = 0
                     self.vacuum_active = False
                     self.vacuum_phase = "IDLE"
                     self.is_scanning_for_marker = False
@@ -1162,7 +1244,7 @@ class GenshinAssistant:
             if patch.shape[0] == 28 and patch.shape[1] == 28:
                 center_bgr = patch[14, 14]
                 center_hsv = cv2.cvtColor(np.uint8([[center_bgr]]), cv2.COLOR_BGR2HSV)[0][0]
-                if 85 <= center_hsv[0] <= 125:
+                if 85 <= center_hsv[0] <= 126:
                     target_name = "quest_blue.png"
                     mtype = "BLUE"
                 else:
@@ -1227,9 +1309,10 @@ class GenshinAssistant:
         current_fps = 0.0
 
         print("\n" + "=" * 70)
-        print(" Genshin Impact CV Assistant Running (v3.3 Concentric Quest)")
+        print(" Genshin Impact CV Assistant Running (v3.4 Production)")
         print(" Hierarchy: DIALOGUE > COMBAT_AUTO > CHEST_LOOT > NAVIGATE")
-        print(" Features : Concentric Blue & Gold Diamonds, Hard Center Lock")
+        print(" Combat   : Strict Horizontal HP Bar Geometry (Anti-Sunset Filter)")
+        print(" Quests   : 30f Multi-Scale Template Scan + 110x110 Fast Local Tracking")
         print(" Hotkeys:")
         print("   [F12] : Instant Global Pause / Resume Toggle")
         print("   [T]   : Crop & Save 28x28 Diamond Template (or Left-Click Screen)")
@@ -1283,6 +1366,7 @@ class GenshinAssistant:
                     # 3. SAFETY GUARD: Active-Window Focus Check & F12 Pause
                     if not is_focused:
                         self.hid.stop_all()
+                        self.combat_consecutive_frames = 0
                         self.vacuum_active = False
                         self.vacuum_phase = "IDLE"
                         if self.is_aiming_bow:
@@ -1290,6 +1374,7 @@ class GenshinAssistant:
                             self.is_aiming_bow = False
                     elif self.global_paused:
                         self.hid.stop_all()
+                        self.combat_consecutive_frames = 0
                         self.vacuum_active = False
                         self.vacuum_phase = "IDLE"
                         if self.is_aiming_bow:
@@ -1330,7 +1415,9 @@ class GenshinAssistant:
                         cv2.imshow("Genshin Assistant Debug", debug_frame)
 
                         # Display Tuner Mask thumbnail
-                        _, _, gold_mask, _ = self.detector.track_quest_marker(frame, self.config)
+                        _, _, gold_mask, _, _, _ = self.detector.track_quest_marker(
+                            frame, self.config, self.frame_idx, self.last_template_lock
+                        )
                         mask_display = cv2.cvtColor(cv2.resize(gold_mask, (480, 270)), cv2.COLOR_GRAY2BGR)
                         cv2.putText(
                             mask_display,
@@ -1378,6 +1465,7 @@ class GenshinAssistant:
                 print(f"[STATE] Entered {STATE_DIALOGUE} (Minimap hidden, metric: {minimap_score:.3f})")
                 self.hid.stop_all()
                 self.hid.release_lmb()
+                self.combat_consecutive_frames = 0
                 self.is_scanning_for_marker = False
                 self.f_prompt_consecutive_frames = 0
                 self.vacuum_active = False
@@ -1395,9 +1483,19 @@ class GenshinAssistant:
             return
 
         # ----------------------------------------------------------------------
-        # HIERARCHY LEVEL 2: COMBAT_AUTO / COMBAT_MANUAL
+        # HIERARCHY LEVEL 2: COMBAT_AUTO / COMBAT_MANUAL (Strict HP Bar Geometry)
         # ----------------------------------------------------------------------
-        in_combat, red_pixels, largest_area, enemy_centroid, is_elevated = self.detector.detect_combat_red_hp_bars(frame)
+        has_hp_bar, num_bars, largest_area, enemy_centroid, is_elevated, hp_bbox = self.detector.detect_combat_red_hp_bars(frame)
+        self.detected_hp_bar_box = hp_bbox
+
+        if has_hp_bar:
+            self.combat_consecutive_frames += 1
+        else:
+            self.combat_consecutive_frames = 0
+
+        # Require >= 2 consecutive frames before entering COMBAT_AUTO
+        # Once in combat, stay engaged as long as has_hp_bar is True
+        in_combat = (self.current_state in (STATE_COMBAT_AUTO, STATE_COMBAT_MANUAL) and has_hp_bar) or (self.combat_consecutive_frames >= 2)
 
         if in_combat:
             self.combat_clear_start = 0.0
@@ -1408,13 +1506,13 @@ class GenshinAssistant:
                 self.current_state = STATE_COMBAT_AUTO
                 self.combat_start_time = now
                 self.melee_damage_stall_timer = now
-                self.last_enemy_hp_pixels = red_pixels
+                self.last_enemy_hp_pixels = int(largest_area)
                 self.is_scanning_for_marker = False
                 self.vacuum_active = False
                 self.vacuum_phase = "IDLE"
                 self.hid.stop_walk()
                 self.hid.stop_all()
-                print(f"[STATE] Entered {STATE_COMBAT_AUTO} (Enemies: {red_pixels}px, elevated: {is_elevated})")
+                print(f"[STATE] Entered {STATE_COMBAT_AUTO} (Valid HP bars: {num_bars}, aspect ratio >= 5.5, elevated: {is_elevated})")
 
             if self.current_state == STATE_COMBAT_AUTO and (now - self.combat_start_time > 45.0):
                 print(f"[STATE] Combat exceeded 45s threshold -> {STATE_COMBAT_MANUAL}")
@@ -1423,7 +1521,7 @@ class GenshinAssistant:
                 play_alert_chime(880, 300)
 
             if self.current_state == STATE_COMBAT_AUTO:
-                self._execute_auto_combat_step(now, is_elevated, red_pixels)
+                self._execute_auto_combat_step(now, is_elevated, int(largest_area))
             else:
                 self.hid.stop_all()
 
@@ -1431,11 +1529,12 @@ class GenshinAssistant:
             return
 
         elif self.current_state in (STATE_COMBAT_AUTO, STATE_COMBAT_MANUAL):
+            # 0 valid HP bars detected -> wait >= 1.5s before exiting combat
             if self.combat_clear_start == 0.0:
                 self.combat_clear_start = now
 
             if now - self.combat_clear_start >= 1.5:
-                print("[STATE] Combat ended (0 HP bars for 1.5s). Resuming overworld.")
+                print("[STATE] Combat ended (0 valid HP bars for 1.5s). Resuming overworld.")
                 self.hid.stop_all()
                 if self.is_aiming_bow:
                     self.hid.press_r()
@@ -1476,7 +1575,7 @@ class GenshinAssistant:
             self.active_chest_box = None
 
         # ----------------------------------------------------------------------
-        # HIERARCHY LEVEL 4: NAVIGATE (with Road-Following & EMA Smoothing)
+        # HIERARCHY LEVEL 4: NAVIGATE (30f Multi-Scale Template + 110x110 Local Tracking)
         # ----------------------------------------------------------------------
         self.current_state = STATE_NAVIGATE
         self._execute_navigate_step(now, frame, frame_half)
@@ -1642,7 +1741,7 @@ class GenshinAssistant:
                 self.combat_step_ready_time = now + random.uniform(0.45, 0.75)
 
     # ==========================================================================
-    # Overworld Navigation (Hybrid Quest Detection & Hard Center Lock)
+    # Overworld Navigation (30f Multi-Scale Scan + 110x110 Fast Local Tracking)
     # ==========================================================================
     def _execute_navigate_step(self, now: float, frame: np.ndarray, frame_half: np.ndarray):
         # 1. Transition V pulse from Dialogue
@@ -1691,16 +1790,26 @@ class GenshinAssistant:
         quest_bearing, road_bearing, has_road = self.detector.analyze_minimap_road_and_quest(frame)
         self.active_road_following = has_road
 
-        # 5. Hybrid Gold & Concentric Blue Quest Marker Tracking (with Stamina Exclusion Zone)
-        centroid, marker_type, _, bbox = self.detector.track_quest_marker(frame, self.config)
+        # 5. Hybrid 30f Multi-Scale Template Scan + 110x110 Local Tracking
+        centroid, marker_type, _, bbox, score, scan_mode = self.detector.track_quest_marker(
+            frame, self.config, self.frame_idx, self.last_template_lock
+        )
         self.active_marker_type = marker_type
         self.active_marker_centroid = centroid
         self.active_marker_bbox = bbox
+        self.active_marker_score = score
+        self.active_scan_mode = scan_mode
 
         if centroid is not None:
             self.marker_last_seen_time = now
             self.is_stuck_alert = False
             self.is_scanning_for_marker = False
+            self.last_template_lock = {
+                "centroid": centroid,
+                "type": marker_type,
+                "bbox": bbox,
+                "score": score,
+            }
             cx, cy = centroid
 
             raw_error_x = cx - 640
@@ -1708,9 +1817,6 @@ class GenshinAssistant:
             # ------------------------------------------------------------------
             # HARD CENTER LOCK & ROAD BIAS ARBITRATION
             # ------------------------------------------------------------------
-            # When abs(error_x) <= 28 px (marker is centered):
-            # Immediately zero out steering (dx = 0) and suppress minimap road bias
-            # to prevent post-lock camera drift!
             lock_deadzone = int(self.config.get("center_lock_deadzone", 28))
 
             if abs(raw_error_x) <= lock_deadzone:
@@ -1755,6 +1861,9 @@ class GenshinAssistant:
                         self.hid.send_command("W1")
 
         else:
+            # Drop lock if undetected
+            self.last_template_lock = None
+
             # ------------------------------------------------------------------
             # LOST-MARKER HANDLING: PULSE 'V' FIRST, WAIT 0.9s, THEN SWEEP
             # ------------------------------------------------------------------
@@ -1835,9 +1944,9 @@ class GenshinAssistant:
         cv2.rectangle(debug_frame, (gx1, gy1), (gx2, gy2), (255, 0, 255), 1)
         cv2.putText(debug_frame, f"Ground Motion: {self.smooth_motion_score:.2f}", (gx1 + 5, gy1 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
 
-        # 6. Combat HP Scan ROI (Red)
+        # 6. Combat HP Scan ROI (Red - Strict Geometry Bounds)
         kby1, kby2, kbx1, kbx2 = ROI_COMBAT
-        combat_color = (0, 0, 255) if self.current_state in (STATE_COMBAT_AUTO, STATE_COMBAT_MANUAL) else (50, 50, 160)
+        combat_color = (0, 0, 255) if self.current_state in (STATE_COMBAT_AUTO, STATE_COMBAT_MANUAL) else (60, 60, 160)
         cv2.rectangle(debug_frame, (kbx1, kby1), (kbx2, kby2), combat_color, 1)
 
         # 7. Interact Prompt ROI (Teal)
@@ -1849,7 +1958,7 @@ class GenshinAssistant:
         cv2.rectangle(debug_frame, (px1, py1), (px2, py2), (140, 100, 220), 1)
         cv2.putText(debug_frame, f"Party: {self.detected_party_size} Slots", (px1 - 25, py1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 100, 220), 1)
 
-        # 9. Draw Active Quest Reticle (Gold or Blue)
+        # 9. Draw Active Quest Reticle (Gold or Blue) & Template Scan Status
         if self.active_marker_centroid is not None and self.current_state == STATE_NAVIGATE:
             mcx, mcy = self.active_marker_centroid
             raw_err = mcx - 640
@@ -1857,20 +1966,32 @@ class GenshinAssistant:
 
             if self.active_marker_type == "BLUE":
                 reticle_color = (255, 200, 0)
-                reticle_label = "QUEST [BLUE]"
+                type_tag = "BLUE"
             else:
                 reticle_color = (0, 215, 255)
-                reticle_label = "QUEST [GOLD]"
+                type_tag = "GOLD"
+
+            # Overlay tag: e.g. TMPL [GOLD] 0.82 | Scan: 30f
+            if "Track" in self.active_scan_mode or "Scan" in self.active_scan_mode:
+                reticle_label = f"TMPL [{type_tag}] {self.active_marker_score:.2f} | {self.active_scan_mode}"
+            else:
+                reticle_label = f"QUEST [{type_tag}]"
 
             if is_locked:
-                reticle_label += " [CENTER LOCKED]"
+                reticle_label += " [LOCKED]"
                 cv2.rectangle(debug_frame, (mcx - 18, mcy - 18), (mcx + 18, mcy + 18), (0, 255, 0), 2)
             else:
                 cv2.circle(debug_frame, (mcx, mcy), 10, reticle_color, 2)
 
             cv2.line(debug_frame, (mcx - 16, mcy), (mcx + 16, mcy), reticle_color, 2)
-            cv2.line(debug_frame, (mcx, mcy - 16), (mcx, mcy + 16), reticle_color, 2)
-            cv2.putText(debug_frame, reticle_label, (mcx - 45, mcy - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.50, reticle_color, 2)
+            cv2.line(debug_frame, (mcx, mcy - 16), (mcx + 16, mcy), reticle_color, 2)
+            cv2.putText(debug_frame, reticle_label, (mcx - 65, mcy - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.46, reticle_color, 2)
+
+        # Draw Detected Enemy HP Bar Box (if present)
+        if self.detected_hp_bar_box:
+            hbx, hby, hbw, hbh = self.detected_hp_bar_box
+            cv2.rectangle(debug_frame, (hbx, hby), (hbx + hbw, hby + hbh), (0, 0, 255), 2)
+            cv2.putText(debug_frame, f"HP BAR ({hbw}x{hbh})", (hbx, hby - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 0, 255), 1)
 
         # Draw Overworld [F] Prompt Box (Cyan)
         if (time.time() < self.show_overworld_f_box_until or self.f_prompt_consecutive_frames >= 2) and self.f_prompt_box:
@@ -2016,7 +2137,7 @@ class GenshinAssistant:
 # CLI Entrypoint
 # ==============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Genshin Impact CV Automation with ESP32-S3 HID (v3.3 Concentric Quest)")
+    parser = argparse.ArgumentParser(description="Genshin Impact CV Automation with ESP32-S3 HID (v3.4 Production)")
     parser.add_argument("--port", type=str, default="COM4", help="Serial COM port of ESP32-S3 (default: COM4)")
     parser.add_argument(
         "--dry-run",
