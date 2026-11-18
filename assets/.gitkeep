@@ -1,0 +1,7 @@
+# Placeholder directory for optional template matching assets:
+# - minimap_border.png (minimap circular outline template)
+# - choice_icon.png (dialogue speech bubble / choice icon template)
+#
+# If these files are absent, the application automatically falls back to:
+# - Canny edge-density analysis for minimap presence
+# - HSV bright-white contour analysis for dialogue choice detection
