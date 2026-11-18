@@ -20,12 +20,14 @@ Architecture:
                        - Width: 34..140 px, Height: 3..10 px, Aspect Ratio >= 5.5, Extent >= 0.65
                        - Non-blocking Amber bow aim-shot state machine (active 2-axis tracking during charge).
     3. CHEST_LOOT    : Hollow-ring geometry (fill extent 0.12..0.48, 4-frame confirmation) & loot vacuum.
-    4. NAVIGATE      : Pure Template-Based Multi-Scale Quest Tracking:
-                       - Auto-loads user PNG templates (assets/quest_gold.png & assets/quest_blue.png)
+    4. NAVIGATE      : Hybrid Quest Tracking (Template Matching + Direct Diamond HSV & Dark Outline):
+                       - Auto-loads center 18x18 cropped PNG templates (assets/quest_gold.png & assets/quest_blue.png)
+                       - Direct Diamond HSV + Dark Outline detector running alongside template matching (>= 0.50)
                        - 120x120 local tracking on every frame with immediate full-ROI fallback
-                       - Throttled full scan (every 6th frame) when off-screen to preserve >60 FPS
-                       - Concentric contrast verification (core V - border V >= 25)
-                       - Instant directional turning via minimap quest bearing (Gold & Blue)
+                       - Stamina exclusion zone (x: 520..760, y: 240..540) strictly masked out
+                       - Annulus-masked isolated Gold minimap quest bearing (Blue water/waypoint rejected)
+                       - 4-phase non-endless lost-marker recovery (stationary wait -> V pulse -> 8 discrete steps -> idle halt)
+                       - Context-aware [F] prompt arbitration: single tap on quest arrival, vacuum on post-combat drops, ignores NPCs
                        - Staged obstacle unstuck recovery (0.8s hop -> 1.7s lateral turn + hop)
 - Safety & Hotkeys:
     - [F12] : Global Pause / Resume Toggle

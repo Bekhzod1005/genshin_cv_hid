@@ -68,6 +68,10 @@ class VisionDetector:
         if os.path.exists(QUEST_GOLD_TEMPLATE_PATH):
             tmpl = cv2.imread(QUEST_GOLD_TEMPLATE_PATH, cv2.IMREAD_COLOR)
             if tmpl is not None:
+                th, tw = tmpl.shape[:2]
+                if th > 18 and tw > 18:
+                    cy, cx = th // 2, tw // 2
+                    tmpl = tmpl[cy - 9 : cy + 9, cx - 9 : cx + 9]
                 self.quest_gold_template = tmpl
                 self.quest_gold_template_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
                 print(f"[VISION] Loaded Gold Quest template ({tmpl.shape[1]}x{tmpl.shape[0]}) from {QUEST_GOLD_TEMPLATE_PATH}")
@@ -75,6 +79,10 @@ class VisionDetector:
         if os.path.exists(QUEST_BLUE_TEMPLATE_PATH):
             tmpl = cv2.imread(QUEST_BLUE_TEMPLATE_PATH, cv2.IMREAD_COLOR)
             if tmpl is not None:
+                th, tw = tmpl.shape[:2]
+                if th > 18 and tw > 18:
+                    cy, cx = th // 2, tw // 2
+                    tmpl = tmpl[cy - 9 : cy + 9, cx - 9 : cx + 9]
                 self.quest_blue_template = tmpl
                 self.quest_blue_template_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
                 print(f"[VISION] Loaded Blue Quest template ({tmpl.shape[1]}x{tmpl.shape[0]}) from {QUEST_BLUE_TEMPLATE_PATH}")
@@ -132,7 +140,9 @@ class VisionDetector:
         self, frame_bgr: np.ndarray
     ) -> Tuple[Optional[float], Optional[float], bool, Optional[str]]:
         """
-        Extract quest bearing (Gold AND Blue blips) and segment paths inside circular minimap.
+        Extract quest bearing (isolated Gold blip only) and segment paths inside circular minimap.
+        Excludes Blue blips completely to prevent water/waypoint/player-arrow false positives.
+        Masks out central player arrow (r < 18 px) and outer UI border (r > 58 px).
         Returns: (quest_bearing_rad, road_bearing_rad, has_road, blip_type)
         """
         cx, cy = MINIMAP_CENTER
@@ -144,51 +154,39 @@ class VisionDetector:
 
         hsv_mini = cv2.cvtColor(mini_roi, cv2.COLOR_BGR2HSV)
 
-        # 1. Gold Quest Blip: H: 18..38, S: 130..255, V: 175..255
-        gold_mask = cv2.inRange(hsv_mini, np.array([18, 130, 175]), np.array([38, 255, 255]))
+        # Annulus mask: 18 <= r <= 58 to exclude central player arrow (r < 18) and outer rim (r > 58)
+        local_annulus = np.zeros((2 * r, 2 * r), dtype=np.uint8)
+        cv2.circle(local_annulus, (r, r), 58, 255, -1)
+        cv2.circle(local_annulus, (r, r), 18, 0, -1)
 
-        # 2. Blue Quest Blip: H: 92..124, S: 85..255, V: 165..255
-        blue_mask = cv2.inRange(hsv_mini, np.array([92, 85, 165]), np.array([124, 255, 255]))
-
-        local_circle = np.zeros((2 * r, 2 * r), dtype=np.uint8)
-        cv2.circle(local_circle, (r, r), r - 3, 255, -1)
-
-        gold_in_mini = cv2.bitwise_and(gold_mask, local_circle)
-        blue_in_mini = cv2.bitwise_and(blue_mask, local_circle)
+        # Isolated Gold Quest Diamond blip: H: 19..33, S: 175..255, V: 205..255
+        gold_mask = cv2.inRange(hsv_mini, np.array([19, 175, 205]), np.array([33, 255, 255]))
+        gold_in_annulus = cv2.bitwise_and(gold_mask, local_annulus)
 
         quest_bearing = None
         blip_type = None
 
-        # Check Gold blips first
-        q_contours, _ = cv2.findContours(gold_in_mini, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Check Gold blips
+        q_contours, _ = cv2.findContours(gold_in_annulus, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for qc in q_contours:
-            if 8 <= cv2.contourArea(qc) <= 450:
-                M = cv2.moments(qc)
-                if M["m00"] > 0:
-                    q_local_x = M["m10"] / M["m00"]
-                    q_local_y = M["m01"] / M["m00"]
-                    dx = q_local_x - r
-                    dy = q_local_y - r
-                    quest_bearing = math.atan2(dx, -dy)
-                    blip_type = "GOLD"
-                    break
-
-        # Check Blue blips if no Gold blip found
-        if quest_bearing is None:
-            b_contours, _ = cv2.findContours(blue_in_mini, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for bc in b_contours:
-                if 8 <= cv2.contourArea(bc) <= 450:
-                    M = cv2.moments(bc)
+            area = cv2.contourArea(qc)
+            if 10 <= area <= 65:
+                bx, by, bw, bh = cv2.boundingRect(qc)
+                if bw <= 12 and bh <= 12:
+                    M = cv2.moments(qc)
                     if M["m00"] > 0:
                         q_local_x = M["m10"] / M["m00"]
                         q_local_y = M["m01"] / M["m00"]
                         dx = q_local_x - r
                         dy = q_local_y - r
                         quest_bearing = math.atan2(dx, -dy)
-                        blip_type = "BLUE"
+                        blip_type = "GOLD"
                         break
 
         # Road segmentation
+        local_circle = np.zeros((2 * r, 2 * r), dtype=np.uint8)
+        cv2.circle(local_circle, (r, r), r - 3, 255, -1)
+
         road_mask = cv2.inRange(hsv_mini, np.array([12, 15, 155]), np.array([32, 95, 245]))
         road_in_minimap = cv2.bitwise_and(road_mask, local_circle)
 
@@ -375,18 +373,16 @@ class VisionDetector:
 
     def _verify_template_hue(self, patch_bgr: np.ndarray, expected_type: str) -> bool:
         """
-        Verify target hue AND concentric contrast:
-        - Inner core (35% center) must have >= 28% matching hue pixels.
+        Verify target hue in inner core (35% center has >= 28% matching hue pixels):
         - Gold: H: 16..40, S: 115..255, V: 165..255
         - Blue: H: 92..124, S: 55..255, V: 135..255
-        - Concentric Contrast: Mean V(inner core) - Mean V(outer border ring) >= 25.
+        (Removed broken V_core - V_border >= 25 check which fails in daytime Mondstadt)
         """
-        if patch_bgr.size == 0 or patch_bgr.shape[0] < 12 or patch_bgr.shape[1] < 12:
+        if patch_bgr.size == 0 or patch_bgr.shape[0] < 10 or patch_bgr.shape[1] < 10:
             return False
 
         ph, pw = patch_bgr.shape[:2]
         hsv = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2HSV)
-        val = hsv[:, :, 2]
 
         # Define 35% inner core
         cw = max(3, int(pw * 0.35))
@@ -409,35 +405,14 @@ class VisionDetector:
             return False
 
         match_ratio = float(cv2.countNonZero(mask)) / float(core_area)
-        if match_ratio < 0.28:
-            return False
-
-        # Concentric contrast verification:
-        # Inner core mean V vs outer border ring mean V
-        v_core_mean = float(np.mean(val[core_y1:core_y2, core_x1:core_x2]))
-
-        # Border mask: everything outside inner 55%
-        border_mask = np.ones((ph, pw), dtype=bool)
-        bw55 = max(4, int(pw * 0.55))
-        bh55 = max(4, int(ph * 0.55))
-        border_mask[cy - bh55 // 2 : cy + bh55 // 2, cx - bw55 // 2 : cx + bw55 // 2] = False
-
-        border_v_pixels = val[border_mask]
-        if border_v_pixels.size == 0:
-            return False
-
-        v_border_mean = float(np.mean(border_v_pixels))
-        contrast_diff = v_core_mean - v_border_mean
-
-        # Must have at least 25 units contrast above outer border
-        return contrast_diff >= 25.0
+        return match_ratio >= 0.28
 
     def _is_sky_or_water_background(self, frame_bgr: np.ndarray, cx: int, cy: int) -> bool:
-        """Sky & Water Rejection: Inspect surrounding 48x48 box. Reject if > 50% blue."""
-        sy1 = max(0, cy - 24)
-        sy2 = min(TARGET_HEIGHT, cy + 24)
-        sx1 = max(0, cx - 24)
-        sx2 = min(TARGET_WIDTH, cx + 24)
+        """Sky & Water Rejection: Inspect surrounding 44x44 box. Reject if >= 45% blue."""
+        sy1 = max(0, cy - 22)
+        sy2 = min(TARGET_HEIGHT, cy + 22)
+        sx1 = max(0, cx - 22)
+        sx2 = min(TARGET_WIDTH, cx + 22)
         surround = frame_bgr[sy1:sy2, sx1:sx2]
         if surround.size == 0:
             return True
@@ -447,7 +422,113 @@ class VisionDetector:
         blue_pixel_count = cv2.countNonZero(sky_blue_mask)
         total_pixels = surround.shape[0] * surround.shape[1]
         blue_ratio = float(blue_pixel_count) / float(total_pixels)
-        return blue_ratio > 0.50
+        return blue_ratio >= 0.45
+
+    def _has_dark_outline(self, roi_val: np.ndarray, c: np.ndarray, bx: int, by: int, bw: int, bh: int) -> bool:
+        """Verify >= 15% of pixels in the 2-3px dilated outline ring have V < 140."""
+        h, w = roi_val.shape[:2]
+        px1 = max(0, bx - 4)
+        py1 = max(0, by - 4)
+        px2 = min(w, bx + bw + 4)
+        py2 = min(h, by + bh + 4)
+        if px2 <= px1 or py2 <= py1:
+            return False
+
+        patch_val = roi_val[py1:py2, px1:px2]
+        patch_h, patch_w = patch_val.shape[:2]
+
+        local_c = c - np.array([px1, py1])
+        core_mask = np.zeros((patch_h, patch_w), dtype=np.uint8)
+        cv2.drawContours(core_mask, [local_c], -1, 255, -1)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        dilated = cv2.dilate(core_mask, kernel, iterations=2)
+        ring_mask = cv2.bitwise_and(dilated, cv2.bitwise_not(core_mask))
+
+        ring_pixels = patch_val[ring_mask > 0]
+        if ring_pixels.size == 0:
+            return False
+
+        dark_count = int(np.count_nonzero(ring_pixels < 140))
+        return (float(dark_count) / float(ring_pixels.size)) >= 0.15
+
+    def detect_direct_diamonds(
+        self,
+        roi_bgr: np.ndarray,
+        hsv_roi: np.ndarray,
+        x_offset: int,
+        y_offset: int,
+        blue_enabled: bool,
+        frame_bgr: np.ndarray,
+    ) -> List[Dict[str, Any]]:
+        """
+        Direct Diamond HSV + Dark-Outline Detector:
+        - Gold Core: H: 17..38, S: 135..255, V: 185..255, bounding box 8 <= w, h <= 28, aspect 0.72..1.38.
+        - Blue Core: H: 90..122, S: 60..255, V: 145..255 with cyan center (V >= 210) and not surrounded by sky/water (< 45% blue in 44x44 outer ring).
+        - Immediate 2-3 px dark outline check: >= 15% of dilated outline ring pixels have V < 140.
+        """
+        val_roi = hsv_roi[:, :, 2]
+        candidates = []
+
+        # Gold Mask
+        gold_mask = cv2.inRange(hsv_roi, np.array([17, 135, 185]), np.array([38, 255, 255]))
+        # Blue Mask
+        blue_mask = cv2.inRange(hsv_roi, np.array([90, 60, 145]), np.array([122, 255, 255])) if blue_enabled else None
+
+        # Process Gold
+        contours, _ = cv2.findContours(gold_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if 8 <= bw <= 28 and 8 <= bh <= 28:
+                aspect = float(bw) / float(bh)
+                if 0.72 <= aspect <= 1.38:
+                    tcx = x_offset + bx + bw // 2
+                    tcy = y_offset + by + bh // 2
+                    # Central stamina exclusion zone check
+                    if 520 <= tcx <= 760 and 240 <= tcy <= 540:
+                        continue
+                    if self._has_dark_outline(val_roi, c, bx, by, bw, bh):
+                        candidates.append({
+                            "type": "GOLD",
+                            "score": 0.88,
+                            "centroid": (tcx, tcy),
+                            "bbox": (x_offset + bx, y_offset + by, bw, bh),
+                            "scan_mode": "Direct Diamond: Gold",
+                        })
+
+        # Process Blue
+        if blue_mask is not None:
+            contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                if 8 <= bw <= 28 and 8 <= bh <= 28:
+                    aspect = float(bw) / float(bh)
+                    if 0.72 <= aspect <= 1.38:
+                        tcx = x_offset + bx + bw // 2
+                        tcy = y_offset + by + bh // 2
+                        if 520 <= tcx <= 760 and 240 <= tcy <= 540:
+                            continue
+                        # Cyan center check: center 35% must have V >= 210
+                        cw = max(2, int(bw * 0.35))
+                        ch = max(2, int(bh * 0.35))
+                        ccx = bx + bw // 2
+                        ccy = by + bh // 2
+                        core_val = val_roi[ccy - ch // 2 : ccy + ch // 2 + 1, ccx - cw // 2 : ccx + cw // 2 + 1]
+                        if core_val.size == 0 or np.max(core_val) < 210:
+                            continue
+                        # Surround sky/water rejection: < 45% blue pixels in 44x44
+                        if self._is_sky_or_water_background(frame_bgr, tcx, tcy):
+                            continue
+                        if self._has_dark_outline(val_roi, c, bx, by, bw, bh):
+                            candidates.append({
+                                "type": "BLUE",
+                                "score": 0.82,
+                                "centroid": (tcx, tcy),
+                                "bbox": (x_offset + bx, y_offset + by, bw, bh),
+                                "scan_mode": "Direct Diamond: Blue",
+                            })
+
+        return candidates
 
     def track_quest_marker(
         self,
@@ -457,18 +538,19 @@ class VisionDetector:
         last_lock: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Tuple[int, int]], Optional[str], Optional[Tuple[int, int, int, int]], float, str]:
         """
-        Pure Template-Based Multi-Scale Quest Tracking (v5):
-        - Local 120x120 window search every frame if locked; immediate full fallback if missed.
-        - Throttled full-screen scan (every 6th frame) when off-screen to preserve >60 FPS.
-        - Concentric contrast verification and stamina exclusion zone masking.
+        Hybrid Quest Tracking: Template Matching (>= 0.50) + Direct Diamond HSV & Dark-Outline Detector.
+        - Fast 120x120 window search if locked; immediate fallback if missed.
+        - Full scan runs multi-scale template matching + direct diamond detector.
+        - Stamina exclusion zone (x: 520..760, y: 240..540) is strictly masked out.
         Returns: (centroid, marker_type, bbox, score, scan_mode_label)
         """
         y1, y2, x1, x2 = ROI_NAV
         roi = frame_bgr[y1:y2, x1:x2]
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray_full = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-        match_thresh = float(config.get("template_match_threshold", 0.64))
+        match_thresh = float(config.get("template_match_threshold", 0.50))
         blue_enabled = bool(config.get("blue_marker_enabled", True))
 
         # Central Stamina Exclusion Zone relative to ROI_NAV
@@ -511,18 +593,30 @@ class VisionDetector:
             # If local tracking missed on this frame, immediately fall through to full scan!
             should_run_full_scan = True
         else:
-            # When unlocked, throttle full scan to every 6th frame to keep FPS high
-            should_run_full_scan = (frame_idx % 6 == 0)
+            # When unlocked, scan every 4th frame for responsive acquisition
+            should_run_full_scan = (frame_idx % 4 == 0)
 
         if not should_run_full_scan:
             return None, None, None, 0.0, "None"
 
         # ----------------------------------------------------------------------
-        # FULL-ROI MULTI-SCALE SCAN (scales: 0.85, 1.0, 1.15)
+        # CANDIDATE COLLECTION: DIRECT DIAMOND + TEMPLATE MATCHING
         # ----------------------------------------------------------------------
-        template_candidates: List[Dict[str, Any]] = []
+        candidates: List[Dict[str, Any]] = []
 
-        # 1. Gold Template Scan
+        # 1. Direct Diamond HSV + Dark-Outline Detector
+        direct_diamonds = self.detect_direct_diamonds(
+            roi_bgr=roi,
+            hsv_roi=hsv_roi,
+            x_offset=x1,
+            y_offset=y1,
+            blue_enabled=blue_enabled,
+            frame_bgr=frame_bgr,
+        )
+        candidates.extend(direct_diamonds)
+
+        # 2. Multi-Scale Template Matching Scan (scales: 0.85, 1.0, 1.15)
+        # Gold Template Scan
         if self.quest_gold_template_gray is not None:
             for scale in (0.85, 1.0, 1.15):
                 tw = int(self.quest_gold_template_gray.shape[1] * scale)
@@ -539,16 +633,16 @@ class VisionDetector:
                     tcy = y1 + ty + th // 2
                     patch = roi[ty : ty + th, tx : tx + tw]
                     if self._verify_template_hue(patch, "GOLD"):
-                        template_candidates.append({
+                        candidates.append({
                             "type": "GOLD",
                             "score": float(max_val),
                             "centroid": (tcx, tcy),
                             "bbox": (x1 + tx, y1 + ty, tw, th),
-                            "scan_mode": "Scan: Full",
+                            "scan_mode": "Template: Gold",
                         })
                         break
 
-        # 2. Blue Template Scan
+        # Blue Template Scan
         if blue_enabled and self.quest_blue_template_gray is not None:
             for scale in (0.85, 1.0, 1.15):
                 tw = int(self.quest_blue_template_gray.shape[1] * scale)
@@ -565,18 +659,18 @@ class VisionDetector:
                     tcy = y1 + ty + th // 2
                     patch = roi[ty : ty + th, tx : tx + tw]
                     if self._verify_template_hue(patch, "BLUE") and not self._is_sky_or_water_background(frame_bgr, tcx, tcy):
-                        template_candidates.append({
+                        candidates.append({
                             "type": "BLUE",
                             "score": float(max_val),
                             "centroid": (tcx, tcy),
                             "bbox": (x1 + tx, y1 + ty, tw, th),
-                            "scan_mode": "Scan: Full",
+                            "scan_mode": "Template: Blue",
                         })
                         break
 
-        if template_candidates:
-            template_candidates.sort(key=lambda item: (1 if item["type"] == "GOLD" else 0, item["score"]), reverse=True)
-            best = template_candidates[0]
+        if candidates:
+            candidates.sort(key=lambda item: (1 if item["type"] == "GOLD" else 0, item["score"]), reverse=True)
+            best = candidates[0]
             return best["centroid"], best["type"], best["bbox"], best["score"], best["scan_mode"]
 
         return None, None, None, 0.0, "None"

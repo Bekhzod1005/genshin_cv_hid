@@ -87,10 +87,10 @@ HARDCODED_DEFAULTS = {
     "pivot_error_threshold": 115,
     "road_following_enabled": True,
     "blue_marker_enabled": True,
-    "template_match_threshold": 0.64,
-    "quest_v_pulse_cooldown": 4.5,
-    "lost_marker_v_delay": 0.75,
-    "lost_marker_sweep_delay": 1.65,
+    "template_match_threshold": 0.50,
+    "quest_v_pulse_cooldown": 5.0,
+    "lost_marker_v_delay": 0.8,
+    "lost_marker_sweep_delay": 1.8,
 }
 
 DEFAULT_CONFIG = HARDCODED_DEFAULTS.copy()

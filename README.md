@@ -34,32 +34,36 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
 
 ---
 
-## v5 Architecture & Audited Bug Fixes
+## v5.1 Architecture & Runtime Regression Overhaul
 
-1. **Staged Non-Blocking Obstacle Unstuck State Machine:**
+1. **Robust 3D Quest Marker Locking (Hybrid Template + Direct Diamond Detection):**
+   - **Deleted Broken Border Contrast Check:** Removed the fragile $V_{core} - V_{border} \ge 25$ outer-border subtraction check that failed in bright daytime Mondstadt overworld conditions where sky, grass, and clouds have $V \ge 210$.
+   - **Inner $18 \times 18$ Cropping:** Loaded templates (`assets/quest_gold.png` and `assets/quest_blue.png`) are automatically center-cropped to $18 \times 18$ at runtime, stripping away static outer background corners while keeping on-disk PNGs untouched.
+   - **Direct Diamond HSV + Dark Outline Detector:** Runs in parallel with template matching ($\ge 0.50$):
+     - **Gold Core:** `H: 17..38, S: 135..255, V: 185..255`, bounding box $8 \le w, h \le 28$, aspect $0.72..1.38$.
+     - **Blue Core:** `H: 90..122, S: 60..255, V: 145..255` with cyan center ($V \ge 210$) and sky/water rejection ($< 45\%$ blue in $44 \times 44$ outer ring).
+     - **Dark Outline Verification:** Verifies that $\ge 15\%$ of pixels in a $2\text{--}3$ px dilated outline ring have $V < 140$, rejecting flat terrain and foliage.
+     - Central stamina arc exclusion zone ($x: 520..760, y: 240..540$) is strictly masked out.
+2. **Eliminated Idle Left Rotation & Minimap False Positives:**
+   - **Annulus Mask & Pure Gold Minimap Blips:** Removed Blue blips completely from minimap analysis to eliminate water/waypoint/player-arrow false positives. Evaluates only the $18 \le r \le 58$ annulus, rejecting the central player arrow ($r < 18$) and outer UI border ($r > 58$). Only reports `quest_bearing` for isolated Gold minimap diamonds (`H: 19..33, S: 175..255, V: 205..255`, area $10..65$ px, $w, h \le 12$).
+   - **4-Phase Non-Endless Lost-Marker Recovery:**
+     - **Phase 1 (Wait Initial):** Immediately halts forward walk (`W0`) and stops camera movement (`dx = 0`) for $0.8$s.
+     - **Phase 2 (Pulse V):** Pulses `V` once ($5.0$s cooldown) and waits $1.0$s completely stationary (`dx = 0, W0`) for the trail or marker to appear.
+     - **Phase 3 (Discrete Step Sweep):** Executes at most 8 discrete step turns (`M32,0` every $0.28$s, pausing between steps).
+     - **Phase 4 (Sweep Complete):** Halts camera rotation completely (`dx = 0, W0`) and remains idle until a marker appears or the $5.0$s `V` pulse cooldown expires. Never spins endlessly.
+3. **Context-Aware `[F]` Prompt Arbitration (Prevent Random NPC Dialogue):**
+   - In `NAVIGATE`, arbitrary overworld `[F]` prompts (NPCs, cooking pots, signposts) no longer trigger loot vacuums or keypresses.
+   - Interacts with `[F]` in only two verified situations:
+     - **Quest Target Arrival:** 3D marker is locked (or locked within last $1.5$s) near center ($|error\_x| \le 95$ px) AND `[F]` prompt appears $\rightarrow$ single `F` tap ($1.2$s cooldown, not vacuum).
+     - **Post-Combat / Sealed Chest Loot:** Only triggers `start_loot_vacuum()` when approaching a confirmed sealed chest in `STATE_CHEST_LOOT` OR within $4.0$s after exiting `STATE_COMBAT_AUTO` (monster drops).
+4. **Staged Non-Blocking Obstacle Unstuck State Machine:**
    - Replaced permanent stall lockout with a staged, non-blocking unstuck routine:
      - **Stage 1 (Stall $\ge 0.8$s):** Pulses `SPACE` jump without stopping forward walking.
      - **Stage 2 (Stall $\ge 1.7$s):** Halts walking (`W0`), pivots laterally $\pm 70$ counts, resumes forward walking (`W1`), and jumps (`SPACE`), resetting the stall timer.
-2. **Instant Directional Turning via Minimap Quest Bearing:**
-   - Detects both Gold (`H: 18..38, S: 130..255, V: 175..255`) and Blue (`H: 92..124, S: 85..255, V: 165..255`) quest blips inside the circular minimap (`center: (114, 96), r: 68`).
-   - When the 3D marker is off-screen, immediately pivots toward the exact shortest bearing at high turn speed rather than waiting $1.65$s or sweeping blindly.
-3. **Non-Blocking Combat & Amber Aiming Sub-States:**
+5. **Non-Blocking Combat & Amber Aiming Sub-States:**
    - Replaced all blocking `time.sleep()` calls in combat with non-blocking timestamp sub-states (`AIM_SWAP_WAIT`, `AIM_ENTER_R`, `AIM_TRACK_AND_CHARGE`, `AIM_RELEASE`).
    - Actively tracks the enemy's moving HP bar with 2-axis mouse steering (`M<dx>,<dy>`) *while* `LMB_HOLD` charges Amber's shot.
-4. **Dialogue Multi-Choice Selection:**
-   - In `STATE_DIALOGUE`, detects speech-bubble option icons in `ROI_CHOICE` and advances multi-choice options with accelerated confirmation cadence.
-5. **False-Positive Quest Rejection (Concentric Contrast Verification):**
-   - Increased template matching threshold to `0.64`.
-   - Requires $\ge 28\%$ of the inner $35\%$ core pixels to match the target quest hue (`Gold H: 16..40`, `Blue H: 92..124`).
-   - Enforces concentric contrast: inner core mean Value ($V_{core}$) must be at least $25$ units brighter than the surrounding border ring ($V_{border}$), rejecting flat sunlit rocks, dirt, and foliage.
-6. **Throttled Full-Screen Scans with Immediate Local Fallback:**
-   - Locked targets use a fast $120 \times 120$ local window every frame; if missed, immediately falls back to a full-ROI scan on that frame.
-   - When unlocked (marker off-screen), full-ROI multi-scale scans are throttled to every 6th frame (`frame_idx % 6 == 0`), sustaining $> 60$ FPS.
-7. **Hollow-Ring Sealed Chest Detection (4-Frame Confirmation):**
-   - Rejects solid red/teal blobs (flowers, barrels, slimes). Enforces fill extent $0.12 \le \text{extent} \le 0.48$ (or inner hole contour via `cv2.RETR_CCOMP`) and requires $\ge 4$ consecutive frames inside `x: 360..920, y: 240..540`.
-8. **Hardened Overworld `[F]` Prompt Detector (3-Frame Confirmation):**
-   - Simultaneously verifies a square bright keycap ($V > 200$, $18 \le bw \le 36$) on the left and a dark translucent pill strip ($V < 95$) containing $\ge 18$ bright white text pixels ($V > 210$) on the right. Requires $\ge 3$ consecutive frames before triggering loot vacuum.
-9. **Two-Zone PD Camera Steering & Pivot-in-Place:**
+6. **Two-Zone PD Camera Steering & Pivot-in-Place:**
    - Firmware micro-stepped mouse movement widened to `[-110, 110]` with $16$-count steps spaced $900\,\mu$s apart.
    - Python PD controller operates at **28 Hz** ($0.035$s update interval) without pre-PD EMA lag:
      - **Zone 1 (Deadzone $|error\_x| \le 24$ px):** $dx = 0$, hard center lock.

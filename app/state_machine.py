@@ -58,6 +58,10 @@ class AssistantStateMachine:
         self.next_scan_sweep_interval: float = 0.22
         self.is_scanning_for_marker: bool = False
         self.last_quest_v_pulse_time: float = 0.0
+        self.lost_marker_phase: str = "IDLE"  # IDLE, WAIT_INITIAL, WAIT_V_PULSE, STEP_SWEEP, SWEEP_COMPLETE
+        self.lost_marker_start_time: float = 0.0
+        self.lost_marker_step_count: int = 0
+        self.last_step_sweep_time: float = 0.0
         self.last_sprint_time: float = time.time()
         self.next_sprint_interval: float = random.uniform(2.2, 3.8)
 
@@ -111,6 +115,7 @@ class AssistantStateMachine:
         self.combat_combo_hit_count: int = 0
         self.melee_damage_stall_timer: float = time.time()
         self.last_enemy_hp_pixels: int = 0
+        self.combat_ended_time: float = 0.0
 
         # Non-Blocking Amber Aim State Machine
         self.is_aiming_bow: bool = False
@@ -225,6 +230,7 @@ class AssistantStateMachine:
                     self.is_aiming_bow = False
                     self.bow_substate = "AIM_IDLE"
                 self.current_state = STATE_NAVIGATE
+                self.combat_ended_time = now
                 self.pending_v_pulse_time = now + random.uniform(0.4, 0.8)
 
             self.previous_minimap_state = True
@@ -496,15 +502,36 @@ class AssistantStateMachine:
             self.hid.press_v()
             self.pending_v_pulse_time = None
 
-        # 2. Overworld [F] Prompt Detection (Keycap + Dark Pill Strip -> 3 consecutive frames)
+        # 2. Overworld [F] Prompt Detection (Keycap + Dark Pill Strip)
         f_prompt_detected, prompt_box = self.detector.detect_overworld_f_prompt(frame)
         if f_prompt_detected and prompt_box:
             self.f_prompt_consecutive_frames += 1
             self.f_prompt_box = prompt_box
-            if self.f_prompt_consecutive_frames >= 3 and (now - self.last_overworld_f_time >= self.overworld_f_cooldown):
-                self.show_overworld_f_box_until = now + 1.2
-                self.start_loot_vacuum(now)
-                return
+            if self.f_prompt_consecutive_frames >= 2 and (now - self.last_overworld_f_time >= self.overworld_f_cooldown):
+                # Situation A: Monster drops within 4.0s of combat end
+                if now - self.combat_ended_time <= 4.0:
+                    print("[NAV] Monster drops detected post-combat -> starting loot vacuum.")
+                    self.show_overworld_f_box_until = now + 1.2
+                    self.start_loot_vacuum(now)
+                    return
+
+                # Situation B: Quest Target Arrival
+                # 3D Marker locked (or locked within last 1.5s) near center (|error_x| <= 95 px)
+                marker_recent = (now - self.marker_last_seen_time <= 1.5)
+                marker_centered = False
+                if self.active_marker_centroid is not None:
+                    marker_centered = (abs(self.active_marker_centroid[0] - 640) <= 95)
+                elif self.last_template_lock is not None and self.last_template_lock.get("centroid") is not None:
+                    marker_centered = (abs(self.last_template_lock["centroid"][0] - 640) <= 95)
+
+                if marker_recent and marker_centered:
+                    print("[NAV] Arrived at quest target with [F] prompt -> single F tap.")
+                    self.hid.press_f()
+                    self.last_overworld_f_time = now
+                    self.overworld_f_cooldown = 1.2
+                    self.show_overworld_f_box_until = now + 1.2
+                    return
+                # Otherwise: ignore arbitrary overworld [F] prompts (NPCs, cooking pots, signs)
         else:
             self.f_prompt_consecutive_frames = 0
 
@@ -544,7 +571,7 @@ class AssistantStateMachine:
         self.active_road_following = has_road
         self.minimap_quest_bearing = quest_bearing
 
-        # 5. Pure Template-Based Quest Tracking
+        # 5. Hybrid Quest Tracking (Template Matching + Direct Diamond HSV & Dark Outline)
         centroid, marker_type, bbox, score, scan_mode = self.detector.track_quest_marker(
             frame, self.config, frame_idx, self.last_template_lock
         )
@@ -557,6 +584,9 @@ class AssistantStateMachine:
         if centroid is not None:
             self.marker_last_seen_time = now
             self.is_scanning_for_marker = False
+            self.lost_marker_phase = "IDLE"
+            self.lost_marker_start_time = 0.0
+            self.lost_marker_step_count = 0
             self.last_template_lock = {
                 "centroid": centroid,
                 "type": marker_type,
@@ -612,6 +642,9 @@ class AssistantStateMachine:
             if quest_bearing is not None:
                 self.marker_last_seen_time = now
                 self.is_scanning_for_marker = False
+                self.lost_marker_phase = "IDLE"
+                self.lost_marker_start_time = 0.0
+                self.lost_marker_step_count = 0
 
                 # Calculate instant pivot towards off-screen bearing
                 pivot_dx, should_pause_walk = self.steering.compute_minimap_pivot(quest_bearing, now)
@@ -623,25 +656,59 @@ class AssistantStateMachine:
                 return
 
             # ------------------------------------------------------------------
-            # LOST-MARKER RECOVERY: PULSE 'V' FIRST, WAIT 0.9s, THEN SWEEP
+            # LOST-MARKER 4-PHASE RECOVERY ROUTINE (NO ENDLESS ROTATION)
+            # 1. Stop camera (dx = 0) and wait 0.8s
+            # 2. Pulse 'V' once (5.0s cooldown) and wait 1.0s completely still (dx=0, W0)
+            # 3. At most 8 discrete step turns (M32,0 every 0.28s, pausing between)
+            # 4. Stop rotating completely (dx=0, W0) and remain idle
             # ------------------------------------------------------------------
-            time_lost = now - self.marker_last_seen_time
-            v_delay = float(self.config.get("lost_marker_v_delay", 0.75))
-            v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 4.5))
+            if self.hid.is_walking:
+                self.hid.stop_walk()
 
-            if time_lost > v_delay and (now - self.last_quest_v_pulse_time >= v_cooldown):
-                self.hid.press_v()
-                self.last_quest_v_pulse_time = now
-                print(f"[NAV] Quest marker lost ({time_lost:.2f}s > {v_delay}s): dispatched 'V' pulse.")
+            if self.lost_marker_phase == "IDLE":
+                self.lost_marker_phase = "WAIT_INITIAL"
+                self.lost_marker_start_time = now
+                self.lost_marker_step_count = 0
 
-            sweep_delay = float(self.config.get("lost_marker_sweep_delay", 1.65))
-            if time_lost > sweep_delay:
-                if self.hid.is_walking:
-                    self.hid.stop_walk()
+            if self.lost_marker_phase == "WAIT_INITIAL":
+                # Phase 1: Wait 0.8s stationary
+                if now - self.lost_marker_start_time >= float(self.config.get("lost_marker_v_delay", 0.8)):
+                    v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
+                    if now - self.last_quest_v_pulse_time >= v_cooldown:
+                        self.hid.press_v()
+                        self.last_quest_v_pulse_time = now
+                        print(f"[NAV] Lost marker: dispatched 'V' pulse.")
+                    self.lost_marker_phase = "WAIT_V_PULSE"
+                    self.lost_marker_start_time = now
 
+            elif self.lost_marker_phase == "WAIT_V_PULSE":
+                # Phase 2: Wait 1.0s completely still for marker to appear
+                if now - self.lost_marker_start_time >= 1.0:
+                    self.lost_marker_phase = "STEP_SWEEP"
+                    self.lost_marker_step_count = 0
+                    self.last_step_sweep_time = now
+
+            elif self.lost_marker_phase == "STEP_SWEEP":
+                # Phase 3: At most 8 discrete step turns (M32,0 every 0.28s)
                 self.is_scanning_for_marker = True
-                if now - self.last_scan_sweep_time >= self.next_scan_sweep_interval:
-                    burst_dx = random.randint(28, 42) * self.scan_sweep_direction
-                    self.hid.move_mouse(burst_dx, 0)
-                    self.last_scan_sweep_time = now
-                    self.next_scan_sweep_interval = random.uniform(0.18, 0.32)
+                if now - self.last_step_sweep_time >= 0.28:
+                    if self.lost_marker_step_count < 8:
+                        step_dx = 32 * self.scan_sweep_direction
+                        self.hid.move_mouse(step_dx, 0)
+                        self.lost_marker_step_count += 1
+                        self.last_step_sweep_time = now
+                    else:
+                        print(f"[NAV] Completed 8-step scan sweep ({self.lost_marker_step_count}/8). Stopping rotation.")
+                        self.is_scanning_for_marker = False
+                        self.lost_marker_phase = "SWEEP_COMPLETE"
+
+            elif self.lost_marker_phase == "SWEEP_COMPLETE":
+                # Phase 4: Remain completely idle until marker appears or V cooldown expires
+                self.is_scanning_for_marker = False
+                v_cooldown = float(self.config.get("quest_v_pulse_cooldown", 5.0))
+                if now - self.last_quest_v_pulse_time >= v_cooldown:
+                    self.hid.press_v()
+                    self.last_quest_v_pulse_time = now
+                    print(f"[NAV] V cooldown expired in idle: dispatched 'V' pulse.")
+                    self.lost_marker_phase = "WAIT_V_PULSE"
+                    self.lost_marker_start_time = now
