@@ -17,16 +17,18 @@
  *   1, 2, 3, 4     -> Character slot select (random hold 48-112 ms)
  *   E              -> Elemental Skill (random hold 48-112 ms)
  *   Q              -> Elemental Burst (random hold 48-112 ms)
- *   F              -> Interact / Dialogue (random hold 48-112 ms)
+ *   R              -> Aiming Mode Toggle for Bow (random hold 45-85 ms)
+ *   F              -> Interact / Dialogue / Loot (random hold 48-112 ms)
  *   V              -> Quest path trace (random hold 48-112 ms)
  *   SPACE          -> Jump / Glide / Unfreeze (random hold 48-112 ms)
  *   LMB            -> Left Mouse Click / Normal Attack (random hold 48-112 ms)
- *   LMB_HOLD       -> Press & hold Left Mouse Button (Charged Attack start)
- *   LMB_REL        -> Release Left Mouse Button (Charged Attack finish)
+ *   LMB_HOLD       -> Press & hold Left Mouse Button (Charged Attack / Aim Shot start)
+ *   LMB_REL        -> Release Left Mouse Button (Charged Attack / Aim Shot fire)
  *   RMB            -> Right Mouse Click / Dash / Dodge (random hold 48-112 ms)
  *   W1             -> Hold 'w' key down (continuous forward movement)
  *   W0 / STOP      -> Immediately release all keyboard keys and mouse buttons
  *   M<dx>          -> Relative horizontal mouse move (clamped [-50, 50])
+ *   M<dx>,<dy>     -> Relative 2-axis mouse move (clamped [-50, 50])
  */
 
 #include "USB.h"
@@ -76,7 +78,7 @@ void processCommand(const char* cmd) {
     return;
   }
 
-  // Dialogue / Interaction key: F
+  // Dialogue / Interaction / Loot key: F
   if (strcmp(cmd, "F") == 0) {
     tapKey('f');
     return;
@@ -97,6 +99,14 @@ void processCommand(const char* cmd) {
   // Elemental Burst: Q
   if (strcmp(cmd, "Q") == 0) {
     tapKey('q');
+    return;
+  }
+
+  // Bow Aiming Mode Toggle: R
+  if (strcmp(cmd, "R") == 0) {
+    Keyboard.press('r');
+    delay(random(45, 85));
+    Keyboard.release('r');
     return;
   }
 
@@ -157,12 +167,21 @@ void processCommand(const char* cmd) {
     return;
   }
 
-  // Relative Mouse Horizontal Steering: M<dx> (e.g., M12, M-8)
+  // Relative Mouse Steering: M<dx> or M<dx>,<dy>
   if (cmd[0] == 'M') {
-    int dx = atoi(cmd + 1);
-    // Clamp to safe range [-50, 50]
+    int dx = 0;
+    int dy = 0;
+    const char* comma = strchr(cmd + 1, ',');
+    if (comma != NULL) {
+      dx = atoi(cmd + 1);
+      dy = atoi(comma + 1);
+    } else {
+      dx = atoi(cmd + 1);
+      dy = 0;
+    }
     dx = constrain(dx, -50, 50);
-    Mouse.move((int8_t)dx, 0);
+    dy = constrain(dy, -50, 50);
+    Mouse.move((int8_t)dx, (int8_t)dy);
     return;
   }
 }

@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """
-Genshin Impact Hardware-Assisted Computer Vision Automation
-============================================================
+Genshin Impact Hardware-Assisted Computer Vision Automation (v3 Overhaul)
+========================================================================
 Architecture:
 - Screen Capture: mss (direct desktop / client-rect capture normalized to 1280x720)
-- Hardware Input: ESP32-S3 Microcontroller running TinyUSB HID Keyboard & Mouse
-- State Machine:
-    1. COMBAT_AUTO   : Non-deterministic starter-roster auto-combat (AR 1-10 friendly)
-                       with dynamic step queues, distance closing, and 45s safety fallback.
-    2. COMBAT_MANUAL : Fallback manual state when auto-combat exceeds 45s timeout.
-    3. DIALOGUE      : Minimap disappearance -> choice icon detection -> randomized F.
-    4. NAVIGATE      : Humanized camera steering (deadzone + Gaussian noise + throttled flicks),
-                       variable sprint cadence (RMB), quest trail (V pulse), and anti-stuck differencing.
+- Hardware Input: ESP32-S3 Microcontroller running TinyUSB HID Keyboard & 2-Axis Mouse
+- Strict State Hierarchy:
+    1. DIALOGUE      : Minimap hidden -> Strict top priority, halts all combat/movement,
+                       runs natural log-normal dialogue & choice progression.
+    2. COMBAT_AUTO   : Red HP bar detected -> Instant W0 halt (no sprinting past enemies),
+                       humanized paced combat (3-hit combo, 6.5-8.5s E, 12-15s Q, 7-10s swap),
+                       dynamic party size (1-4 slots), and Amber Aim-Shot mode for elevated/stalled targets.
+    3. CHEST_LOOT    : Overworld sealed-ring / wooden-gold chest detection -> walk to chest,
+                       stop on [F] prompt, open, and multi-tap [F] to collect item drops.
+    4. NAVIGATE      : Minimap road-following (tracks Mondstadt dirt/stone paths around cliffs),
+                       EMA camera smoothing (alpha=0.35, 15-20Hz rate limiting), 22px deadzone,
+                       hard-turn W0 pauses, off-screen marker sweep, and vertical jump unstuck.
 - Safety & Guards:
     - Active Window Focus Lock (win32gui.GetForegroundWindow() == hwnd)
     - Global F12 Instant Pause / Resume Toggle (pynput)
-    - 8-Second Safety Watchdog in Microcontroller Firmware
+    - 15-Second Safety Watchdog in Microcontroller Firmware + 4.0s keepalive
     - Live HSV & Kp Tuner Window (persists to config.json with 'S')
     - Emergency STOP on exit (finally block)
 """
@@ -73,12 +77,19 @@ ROI_CHOICE = (320, 560, 700, 1090)     # Middle-Right Dialogue Option Area
 ROI_GROUND = (500, 680, 440, 840)      # Lower-Center Ground Motion Differencing
 ROI_COMBAT = (36, 360, 100, 1180)      # Upper/Middle Enemy Health Bar Area
 ROI_INTERACT = (300, 490, 740, 940)    # Overworld [F] Prompt Area
+ROI_PARTY = (170, 470, 1130, 1260)     # Right-Hand Party Portrait Stack
+ROI_CHEST = (180, 620, 200, 1080)      # Overworld Chest Scan Area
 
-# State Definitions
-STATE_NAVIGATE = "NAVIGATE"
+# Minimap Geometry
+MINIMAP_CENTER = (114, 96)
+MINIMAP_RADIUS = 68
+
+# State Definitions (Strict Hierarchy: DIALOGUE > COMBAT_AUTO > CHEST_LOOT > NAVIGATE)
 STATE_DIALOGUE = "DIALOGUE"
 STATE_COMBAT_AUTO = "COMBAT_AUTO"
 STATE_COMBAT_MANUAL = "COMBAT_MANUAL"
+STATE_CHEST_LOOT = "CHEST_LOOT"
+STATE_NAVIGATE = "NAVIGATE"
 
 
 # ==============================================================================
@@ -91,10 +102,7 @@ def human_delay(
     max_val: float = 0.68,
     allow_micro_pause: bool = True,
 ) -> float:
-    """
-    Generate non-deterministic action delays following a log-normal distribution.
-    Features a 10% chance per cycle to inject a natural 0.85s-1.55s human micro-pause.
-    """
+    """Generate non-deterministic action delays following a log-normal distribution."""
     val = random.lognormvariate(math.log(max(mean, 0.05)), sigma)
     clamped = max(min_val, min(max_val, val))
     if allow_micro_pause and random.random() < 0.10:
@@ -103,10 +111,7 @@ def human_delay(
 
 
 def dialogue_advance_delay() -> float:
-    """
-    Generate natural humanized dialogue advance delays (0.38s - 0.78s),
-    with a 12% probability of a 0.95s - 1.45s pause.
-    """
+    """Generate natural humanized dialogue advance delays (0.38s - 0.78s)."""
     val = random.lognormvariate(math.log(0.52), 0.22)
     delay = max(0.38, min(0.78, val))
     if random.random() < 0.12:
@@ -122,7 +127,6 @@ def setup_dpi_awareness():
     if os.name != "nt":
         return
     try:
-        # Per-Monitor DPI Aware v2
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         try:
@@ -149,7 +153,7 @@ def play_alert_chime(frequency: int = 880, duration_ms: int = 220):
 
 
 # ==============================================================================
-# ESP32-S3 Serial HID Controller
+# ESP32-S3 Serial HID Controller (2-Axis Mouse & Bow Aim Support)
 # ==============================================================================
 class ESP32HIDController:
     """Manages serial protocol communication with the ESP32-S3 TinyUSB HID firmware."""
@@ -176,11 +180,10 @@ class ESP32HIDController:
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
 
-            # Handshake verification
             if self.ping():
                 print(f"[HID] Handshake verified! ESP32-S3 ready on {self.port}.")
             else:
-                print(f"[WARN] ESP32-S3 did not return 'PONG'. Serial connection open, continuing...")
+                print(f"[WARN] ESP32-S3 did not return 'PONG'. Continuing...")
         except Exception as e:
             print(f"[ERROR] Could not connect to serial port '{self.port}': {e}")
             print("[INFO] Falling back to DRY-RUN mode (visual state machine only, no HID output).")
@@ -227,8 +230,12 @@ class ESP32HIDController:
         """Trigger Elemental Burst ('Q')."""
         self.send_command("Q")
 
+    def press_r(self):
+        """Toggle Bow Aiming Mode ('R')."""
+        self.send_command("R")
+
     def press_f(self):
-        """Trigger dialogue / interact key ('F')."""
+        """Trigger dialogue / interact / loot key ('F')."""
         self.send_command("F")
 
     def press_v(self):
@@ -244,12 +251,12 @@ class ESP32HIDController:
         self.send_command("LMB")
 
     def hold_lmb(self):
-        """Begin charged attack (hold Left Mouse Button)."""
+        """Begin charged attack / aim shot charge (hold Left Mouse Button)."""
         self.send_command("LMB_HOLD")
         self.is_lmb_held = True
 
     def release_lmb(self):
-        """Release charged attack (release Left Mouse Button)."""
+        """Release charged attack / fire shot (release Left Mouse Button)."""
         self.send_command("LMB_REL")
         self.is_lmb_held = False
 
@@ -278,11 +285,15 @@ class ESP32HIDController:
         self.is_lmb_held = False
         self.walk_start_time = 0.0
 
-    def move_mouse(self, dx: int):
-        """Move mouse horizontally by dx pixels (clamped to [-50, 50])."""
+    def move_mouse(self, dx: int, dy: int = 0):
+        """Move mouse horizontally and/or vertically (clamped to [-50, 50])."""
         clamped_dx = max(-50, min(50, int(dx)))
-        if clamped_dx != 0:
-            self.send_command(f"M{clamped_dx}")
+        clamped_dy = max(-50, min(50, int(dy)))
+        if clamped_dx != 0 or clamped_dy != 0:
+            if clamped_dy != 0:
+                self.send_command(f"M{clamped_dx},{clamped_dy}")
+            else:
+                self.send_command(f"M{clamped_dx}")
 
     def close(self):
         """Safely release all keys and close serial connection."""
@@ -307,10 +318,12 @@ DEFAULT_CONFIG = {
     "V_min": 180,
     "V_max": 255,
     "Kp_x100": 14,
+    "steer_ema_alpha": 0.35,
+    "road_following_enabled": True,
 }
 
 
-def load_config() -> Dict[str, int]:
+def load_config() -> Dict[str, Any]:
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -323,7 +336,7 @@ def load_config() -> Dict[str, int]:
     return DEFAULT_CONFIG.copy()
 
 
-def save_config(config: Dict[str, int]):
+def save_config(config: Dict[str, Any]):
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
@@ -344,7 +357,7 @@ def nothing(x):
     pass
 
 
-def setup_tuner_window(initial_cfg: Dict[str, int]):
+def setup_tuner_window(initial_cfg: Dict[str, Any]):
     cv2.namedWindow(TUNER_WINDOW, cv2.WINDOW_AUTOSIZE)
     cv2.createTrackbar("H_min", TUNER_WINDOW, initial_cfg["H_min"], 179, nothing)
     cv2.createTrackbar("H_max", TUNER_WINDOW, initial_cfg["H_max"], 179, nothing)
@@ -355,7 +368,7 @@ def setup_tuner_window(initial_cfg: Dict[str, int]):
     cv2.createTrackbar("Kp_x100", TUNER_WINDOW, min(initial_cfg["Kp_x100"], 40), 40, nothing)
 
 
-def read_tuner_values() -> Dict[str, int]:
+def read_tuner_values() -> Dict[str, Any]:
     return {
         "H_min": cv2.getTrackbarPos("H_min", TUNER_WINDOW),
         "H_max": cv2.getTrackbarPos("H_max", TUNER_WINDOW),
@@ -422,39 +435,36 @@ class VisionDetector:
                 self.choice_template = tmpl
                 print(f"[VISION] Loaded dialogue choice template from {CHOICE_TEMPLATE_PATH}")
 
+        # Precompute circular minimap mask for road & quest extraction
+        self.minimap_circle_mask = np.zeros((TARGET_HEIGHT, TARGET_WIDTH), dtype=np.uint8)
+        cv2.circle(self.minimap_circle_mask, MINIMAP_CENTER, MINIMAP_RADIUS, 255, -1)
+
     def check_minimap_present(self, frame_bgr: np.ndarray) -> Tuple[bool, float]:
         """
-        State 2 trigger: Detect presence of minimap UI.
-        If minimap disappears, the game is in cutscene / dialogue mode.
+        State 1 trigger: Detect presence of minimap UI.
+        If minimap disappears, the game is strictly in cutscene / dialogue mode.
         """
         y1, y2, x1, x2 = ROI_MINIMAP
         roi = frame_bgr[y1:y2, x1:x2]
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        # 1. Template match if template image exists
         if self.minimap_template is not None:
             res = cv2.matchTemplate(gray, self.minimap_template, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, _ = cv2.minMaxLoc(res)
             return (max_val >= 0.58), float(max_val)
 
-        # 2. Canny edge-density fallback
         edges = cv2.Canny(gray, 60, 160)
         total_pixels = (y2 - y1) * (x2 - x1)
         edge_density = float(np.count_nonzero(edges)) / float(total_pixels)
-        # In overworld, minimap circle border + icons produce > 3.2% edge density
         is_present = edge_density > 0.032
         return is_present, edge_density
 
     def check_choice_icon(self, frame_bgr: np.ndarray) -> Tuple[bool, Optional[Tuple[int, int, int, int]]]:
-        """
-        Detect dialogue speech-bubble / choice icon in middle-right ROI.
-        Returns (detected, (x, y, w, h) in 1280x720 coordinates).
-        """
+        """Detect dialogue speech-bubble / choice icon in middle-right ROI."""
         y1, y2, x1, x2 = ROI_CHOICE
         roi = frame_bgr[y1:y2, x1:x2]
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        # 1. Template match if available
         if self.choice_template is not None:
             res = cv2.matchTemplate(gray, self.choice_template, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, max_loc = cv2.minMaxLoc(res)
@@ -463,7 +473,6 @@ class VisionDetector:
                 box = (x1 + max_loc[0], y1 + max_loc[1], tw, th)
                 return True, box
 
-        # 2. High-contrast white icon detection fallback
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         lower_white = np.array([0, 0, 225], dtype=np.uint8)
         upper_white = np.array([180, 48, 255], dtype=np.uint8)
@@ -488,69 +497,108 @@ class VisionDetector:
     ) -> Tuple[bool, Optional[Tuple[int, int, int, int]]]:
         """
         Detect overworld [F] interaction keycap in y: 300..490, x: 740..940.
-        Genshin's [F] prompt is a high-contrast near-square icon (w, h: 18..42px)
-        with the dark letter 'F' inside a bright white/light-gray rounded keycap.
+        Near-square icon (w, h: 18..42px) with interior high contrast letter 'F'.
         """
         y1, y2, x1, x2 = ROI_INTERACT
         roi = frame_bgr[y1:y2, x1:x2]
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        # Adaptive thresholding to isolate crisp keycap edges regardless of outdoor lighting
         thresh = cv2.adaptiveThreshold(
             gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
         )
-
-        # High brightness mask: keycap body is bright white/light-gray (V >= 195)
         _, bright_mask = cv2.threshold(gray, 195, 255, cv2.THRESH_BINARY)
         combined = cv2.bitwise_and(thresh, bright_mask)
 
-        # Find external contours of keycap candidates
         contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in contours:
             bx, by, bw, bh = cv2.boundingRect(c)
             if 18 <= bw <= 42 and 18 <= bh <= 42:
                 aspect_ratio = float(bw) / float(bh)
                 if 0.75 <= aspect_ratio <= 1.35:
-                    # Interior contrast check: ensure high interior edge contrast
-                    # (letter 'F' inside keycap) so flat bright sky or clouds are rejected
                     patch = gray[by : by + bh, bx : bx + bw]
                     if patch.size > 0:
                         edges = cv2.Canny(patch, 60, 160)
                         edge_count = cv2.countNonZero(edges)
                         std_dev = float(np.std(patch))
-                        # Keycaps with dark glyph 'F' have high variance (std > 20) and interior edges (>= 10)
                         if edge_count >= 10 and std_dev >= 20.0:
                             return True, (x1 + bx, y1 + by, bw, bh)
 
         return False, None
 
+    def detect_party_size(self, frame_bgr: np.ndarray) -> int:
+        """
+        Detect active unlocked party size (1 to 4) by inspecting the right-hand
+        portrait stack (ROI_PARTY: x: 1130..1260, y: 170..470).
+        """
+        # Vertical boundaries for slots 1, 2, 3, 4
+        slot_y_ranges = [
+            (180, 245),  # Slot 1 (Lumine / Starter)
+            (255, 320),  # Slot 2 (Amber)
+            (330, 395),  # Slot 3 (Kaeya)
+            (405, 470),  # Slot 4 (Lisa)
+        ]
+
+        active_count = 1  # Slot 1 is always unlocked
+
+        for slot_idx in range(1, 4):  # Check slots 2, 3, 4
+            sy1, sy2 = slot_y_ranges[slot_idx]
+            slot_roi = frame_bgr[sy1:sy2, 1145:1245]
+            if slot_roi.size == 0:
+                break
+
+            # Character portrait slots feature a distinct health bar and avatar frame
+            # Check for the white number badge / colored HP line in lower portion of the slot
+            hp_band = slot_roi[44:60, 20:85]
+            if hp_band.size == 0:
+                break
+
+            hsv_hp = cv2.cvtColor(hp_band, cv2.COLOR_BGR2HSV)
+            # Green or red HP bar pixels
+            green_mask = cv2.inRange(hsv_hp, np.array([35, 100, 100]), np.array([85, 255, 255]))
+            red_mask1 = cv2.inRange(hsv_hp, np.array([0, 100, 100]), np.array([12, 255, 255]))
+            red_mask2 = cv2.inRange(hsv_hp, np.array([170, 100, 100]), np.array([179, 255, 255]))
+            hp_mask = cv2.bitwise_or(green_mask, cv2.bitwise_or(red_mask1, red_mask2))
+
+            # Also check circular portrait edge density
+            gray_slot = cv2.cvtColor(slot_roi[6:45, 15:85], cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray_slot, 60, 150)
+            edge_density = float(np.count_nonzero(edges)) / float(gray_slot.size)
+
+            # Slot is occupied if HP bar pixels exist or portrait frame has strong edges
+            if cv2.countNonZero(hp_mask) >= 18 or edge_density > 0.08:
+                active_count = slot_idx + 1
+            else:
+                break  # Party slots are always populated sequentially
+
+        return max(1, min(4, active_count))
+
     def detect_combat_red_hp_bars(
         self, frame_bgr: np.ndarray
-    ) -> Tuple[bool, int, float, Optional[Tuple[int, int]]]:
+    ) -> Tuple[bool, int, float, Optional[Tuple[int, int]], bool]:
         """
         Combat trigger: Detect enemy red HP bars in upper/middle screen (y: 36..360).
         Returns:
-            - in_combat: bool (True if enemy red HP pixels exceed threshold)
+            - in_combat: bool
             - pixel_count: int
             - largest_contour_area: float
-            - target_centroid: Optional (cx, cy) in 1280x720 frame
+            - target_centroid: Optional (cx, cy)
+            - is_elevated: bool (True if enemy is high on screen, e.g. Hilichurl archer on tower)
         """
         y1, y2, x1, x2 = ROI_COMBAT
         roi = frame_bgr[y1:y2, x1:x2]
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-        # Bright red health bar ranges wrapping around Hue limits
         mask1 = cv2.inRange(hsv, np.array([0, 150, 140]), np.array([10, 255, 255]))
         mask2 = cv2.inRange(hsv, np.array([170, 150, 140]), np.array([179, 255, 255]))
         red_mask = cv2.bitwise_or(mask1, mask2)
 
-        # Morphological filter tuned for horizontal health bars
         bar_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 2))
         filtered = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, bar_kernel)
         pixel_count = int(cv2.countNonZero(filtered))
 
         largest_area = 0.0
         target_centroid = None
+        is_elevated = False
 
         if pixel_count >= 130:
             contours, _ = cv2.findContours(filtered, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -563,16 +611,131 @@ class VisionDetector:
                         cx = int(M["m10"] / M["m00"]) + x1
                         cy = int(M["m01"] / M["m00"]) + y1
                         target_centroid = (cx, cy)
+                        # Elevated check: Hilichurl archers on towers appear high up (y < 290)
+                        if cy < 290:
+                            is_elevated = True
 
         in_combat = pixel_count >= 130
-        return in_combat, pixel_count, largest_area, target_centroid
+        return in_combat, pixel_count, largest_area, target_centroid, is_elevated
+
+    def detect_chest(
+        self, frame_bgr: np.ndarray
+    ) -> Tuple[bool, Optional[Tuple[int, int, int, int]], Optional[Tuple[int, int]]]:
+        """
+        Detect Common / Exquisite / Precious chests in overworld (ROI_CHEST: x: 200..1080, y: 180..620).
+        Identifies:
+        1. Glowing red/orange/teal sealed-chest lock rings
+        2. Warm wooden-gold chest body contours (area: 400..6500 px)
+        """
+        y1, y2, x1, x2 = ROI_CHEST
+        roi = frame_bgr[y1:y2, x1:x2]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        # 1. Sealed chest glowing ring (red/orange runes)
+        ring_mask1 = cv2.inRange(hsv, np.array([0, 160, 180]), np.array([14, 255, 255]))
+        ring_mask2 = cv2.inRange(hsv, np.array([170, 160, 180]), np.array([179, 255, 255]))
+        ring_mask_teal = cv2.inRange(hsv, np.array([80, 150, 180]), np.array([105, 255, 255]))
+        ring_mask = cv2.bitwise_or(ring_mask1, cv2.bitwise_or(ring_mask2, ring_mask_teal))
+
+        # 2. Chest wooden-gold body
+        body_mask = cv2.inRange(hsv, np.array([10, 75, 65]), np.array([26, 230, 215]))
+        combined_chest = cv2.bitwise_or(ring_mask, body_mask)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        cleaned = cv2.morphologyEx(combined_chest, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            area = cv2.contourArea(c)
+            if 400 <= area <= 6500:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                aspect_ratio = float(bw) / float(bh) if bh > 0 else 0
+                if 0.80 <= aspect_ratio <= 2.30:
+                    cx = x1 + bx + bw // 2
+                    cy = y1 + by + bh // 2
+                    return True, (x1 + bx, y1 + by, bw, bh), (cx, cy)
+
+        return False, None, None
+
+    def analyze_minimap_road_and_quest(
+        self, frame_bgr: np.ndarray
+    ) -> Tuple[Optional[float], Optional[float], bool]:
+        """
+        Extract quest bearing and segment Mondstadt dirt/stone paths inside circular minimap.
+        Returns:
+            - quest_bearing: Optional[float] (angle in radians relative to straight ahead)
+            - road_bearing: Optional[float] (angle in radians of path within +/- 55 deg of quest)
+            - has_road: bool
+        """
+        cx, cy = MINIMAP_CENTER
+        r = MINIMAP_RADIUS
+
+        # Crop square around minimap circle
+        mini_roi = frame_bgr[cy - r : cy + r, cx - r : cx + r]
+        if mini_roi.size == 0:
+            return None, None, False
+
+        hsv_mini = cv2.cvtColor(mini_roi, cv2.COLOR_BGR2HSV)
+
+        # 1. Quest Marker detection inside minimap (gold diamond / arrow)
+        gold_mask = cv2.inRange(hsv_mini, np.array([18, 130, 175]), np.array([36, 255, 255]))
+        q_contours, _ = cv2.findContours(gold_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        quest_bearing = None
+        for qc in q_contours:
+            if 8 <= cv2.contourArea(qc) <= 450:
+                M = cv2.moments(qc)
+                if M["m00"] > 0:
+                    q_local_x = M["m10"] / M["m00"]
+                    q_local_y = M["m01"] / M["m00"]
+                    # Angle relative to straight ahead (Up = -Y):
+                    # atan2(dx, -dy) gives 0 rad = straight ahead, + = right, - = left
+                    dx = q_local_x - r
+                    dy = q_local_y - r
+                    quest_bearing = math.atan2(dx, -dy)
+                    break
+
+        # 2. Road Segmentation inside minimap (dirt / stone path: H: 12..32, S: 15..95, V: 155..245)
+        road_mask = cv2.inRange(hsv_mini, np.array([12, 15, 155]), np.array([32, 95, 245]))
+
+        # Apply circular mask inside local crop
+        local_circle = np.zeros((2 * r, 2 * r), dtype=np.uint8)
+        cv2.circle(local_circle, (r, r), r - 4, 255, -1)
+        road_in_minimap = cv2.bitwise_and(road_mask, local_circle)
+
+        # Find road pixels in the forward cone (+/- 55 degrees of quest bearing or straight ahead)
+        ref_angle = quest_bearing if quest_bearing is not None else 0.0
+        cone_limit = math.radians(55)
+
+        y_indices, x_indices = np.where(road_in_minimap > 0)
+        valid_road_x = []
+        valid_road_y = []
+
+        for px, py in zip(x_indices, y_indices):
+            p_dx = px - r
+            p_dy = py - r
+            dist = math.hypot(p_dx, p_dy)
+            if dist > 14:  # ignore player arrow at exact center
+                p_angle = math.atan2(p_dx, -p_dy)
+                diff_angle = abs(math.atan2(math.sin(p_angle - ref_angle), math.cos(p_angle - ref_angle)))
+                if diff_angle <= cone_limit:
+                    valid_road_x.append(px)
+                    valid_road_y.append(py)
+
+        road_bearing = None
+        has_road = False
+
+        if len(valid_road_x) >= 35:
+            mean_rx = np.mean(valid_road_x)
+            mean_ry = np.mean(valid_road_y)
+            road_bearing = math.atan2(mean_rx - r, -(mean_ry - r))
+            has_road = True
+
+        return quest_bearing, road_bearing, has_road
 
     def track_gold_quest_marker(
-        self, frame_bgr: np.ndarray, tuner_cfg: Dict[str, int]
+        self, frame_bgr: np.ndarray, tuner_cfg: Dict[str, Any]
     ) -> Tuple[Optional[Tuple[int, int]], np.ndarray]:
-        """
-        State 3: Track Gold Quest Marker centroid (cx, cy) inside Central Navigation ROI.
-        """
+        """Track Gold Quest Marker centroid (cx, cy) inside Central Navigation ROI."""
         y1, y2, x1, x2 = ROI_NAV
         roi = frame_bgr[y1:y2, x1:x2]
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -605,10 +768,7 @@ class VisionDetector:
     def calculate_ground_motion(
         self, frame_bgr: np.ndarray, prev_ground_gray: Optional[np.ndarray]
     ) -> Tuple[float, np.ndarray]:
-        """
-        Frame-differencing motion score on the lower-center ground region.
-        Used to detect if the character is stuck running into a wall or cliff.
-        """
+        """Frame-differencing motion score on the lower-center ground region."""
         y1, y2, x1, x2 = ROI_GROUND
         roi = frame_bgr[y1:y2, x1:x2]
         curr_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -633,16 +793,19 @@ class GenshinAssistant:
         self.detector = VisionDetector()
         self.config = load_config()
 
-        # State machine variables
+        # Strict State Hierarchy & Variables
         self.current_state = STATE_NAVIGATE
         self.previous_minimap_state = True
-        self.last_choice_f_time = 0.0
-        self.pending_f_press_time: Optional[float] = None
+        self.detected_party_size: int = 1
         self.marker_last_seen_time = time.time()
+
+        # Camera Smoothing (EMA) & Rate Limiter
+        self.ema_error_x: float = 0.0
+        self.last_mouse_packet_time: float = 0.0
 
         # Humanized Navigation Steering & Movement
         self.last_steer_time = 0.0
-        self.next_steer_interval = random.uniform(0.12, 0.28)
+        self.next_steer_interval = random.uniform(0.055, 0.075)
         self.last_sprint_time = time.time()
         self.next_sprint_interval = random.uniform(2.1, 3.8)
         self.pending_v_pulse_time: Optional[float] = None
@@ -651,38 +814,53 @@ class GenshinAssistant:
         self.next_scan_sweep_interval: float = 0.22
         self.is_scanning_for_marker: bool = False
 
-        # Overworld [F] Prompt Interaction
+        # Road-Following & Unstuck Variables
+        self.active_road_following: bool = False
+        self.unstuck_still_start_time: float = 0.0
+        self.last_lateral_unstuck_time: float = 0.0
+
+        # Overworld [F] Prompt & Chest Loot
         self.f_prompt_consecutive_frames: int = 0
         self.f_prompt_box: Optional[Tuple[int, int, int, int]] = None
         self.last_overworld_f_time: float = 0.0
         self.overworld_f_cooldown: float = 1.6
         self.pending_overworld_f_press_time: Optional[float] = None
         self.show_overworld_f_box_until: float = 0.0
+        self.active_chest_box: Optional[Tuple[int, int, int, int]] = None
 
-        # Fast Humanized Dialogue Skipping
+        # Dialogue Skipping
         self.next_dialogue_f_time: float = 0.0
 
-        # Stuck detection
+        # Ground Motion Stuck Detection
         self.prev_ground_gray: Optional[np.ndarray] = None
         self.smooth_motion_score = 10.0
         self.is_stuck_alert = False
 
-        # Non-Deterministic Auto-Combat System
+        # Deliberate, Paced Auto-Combat System
         self.combat_start_time = 0.0
         self.combat_clear_start = 0.0
-        self.combat_queue: List[Dict[str, Any]] = []
         self.combat_step_ready_time = 0.0
         self.active_combat_action_label = "Idle"
         self.combat_target_centroid: Optional[Tuple[int, int]] = None
         self.combat_largest_area: float = 0.0
-        self.is_closing_distance: bool = False
-        self.close_distance_finish_time: float = 0.0
+        self.current_party_slot: int = 1
+        self.last_party_swap_time: float = time.time()
+        self.next_party_swap_interval: float = random.uniform(7.0, 10.0)
+        self.last_skill_e_time: float = 0.0
+        self.next_skill_e_interval: float = random.uniform(6.5, 8.5)
+        self.last_burst_q_time: float = 0.0
+        self.next_burst_q_interval: float = random.uniform(12.0, 15.0)
+        self.combat_combo_hit_count: int = 0
+        self.melee_damage_stall_timer: float = time.time()
+        self.last_enemy_hp_pixels: int = 0
+        self.is_aiming_bow: bool = False
+        self.bow_aim_shot_count: int = 0
 
-        # Global hotkey pause state
+        # Global Hotkey Pause State
         self.global_paused = False
         self.setup_global_hotkeys()
 
-        # Notification banner timer
+        # Notification Banner Timer
         self.save_banner_until = 0.0
 
     def setup_global_hotkeys(self):
@@ -694,11 +872,12 @@ class GenshinAssistant:
                 print(f"\n[HOTKEY F12] Automation {status} by user.")
                 if self.global_paused:
                     self.hid.stop_all()
-                    self.combat_queue.clear()
-                    self.is_closing_distance = False
                     self.f_prompt_consecutive_frames = 0
                     self.pending_overworld_f_press_time = None
                     self.is_scanning_for_marker = False
+                    if self.is_aiming_bow:
+                        self.hid.press_r()
+                        self.is_aiming_bow = False
 
         listener = keyboard.Listener(on_press=on_press)
         listener.daemon = True
@@ -715,13 +894,14 @@ class GenshinAssistant:
         fps_start_time = time.time()
         current_fps = 0.0
 
-        print("\n" + "=" * 68)
-        print(" Genshin Impact CV Assistant Running (v2 Humanized Auto-Combat)")
+        print("\n" + "=" * 70)
+        print(" Genshin Impact CV Assistant Running (v3 Strict State Overhaul)")
+        print(" Hierarchy: DIALOGUE > COMBAT_AUTO > CHEST_LOOT > NAVIGATE")
         print(" Hotkeys:")
         print("   [F12] : Instant Global Pause / Resume Toggle")
         print("   [S]   : Save current Tuner settings to config.json")
         print("   [Q]   : Clean Shutdown & Emergency Key Release")
-        print("=" * 68 + "\n")
+        print("=" * 70 + "\n")
 
         mss_factory = getattr(mss, "MSS", mss.mss)
         with mss_factory() as sct:
@@ -730,7 +910,7 @@ class GenshinAssistant:
                     loop_start = time.time()
 
                     # 1. Update Tuner sliders
-                    self.config = read_tuner_values()
+                    self.config = {**self.config, **read_tuner_values()}
 
                     # 2. Window Discovery & Focus Check
                     hwnd, client_rect = find_genshin_window()
@@ -755,7 +935,6 @@ class GenshinAssistant:
                         except Exception:
                             frame = None
                     else:
-                        # Fallback capture primary monitor when game window isn't located yet
                         mon = sct.monitors[1]
                         sct_img = sct.grab(mon)
                         frame_raw = np.array(sct_img)[:, :, :3]
@@ -765,35 +944,35 @@ class GenshinAssistant:
                         time.sleep(0.04)
                         continue
 
-                    # Create a copy for visual debug annotations
                     debug_frame = frame.copy()
 
-                    # 4. SAFETY GUARD: Check Window Focus and Global Pause
+                    # 4. SAFETY GUARD: Active-Window Focus Check & F12 Pause
                     if not is_focused:
-                        # Unfocused: Immediately release keys and freeze outputs
                         self.hid.stop_all()
-                        self.combat_queue.clear()
+                        if self.is_aiming_bow:
+                            self.hid.press_r()
+                            self.is_aiming_bow = False
                         self._draw_overlay_notice(debug_frame, "PAUSED (Window Unfocused)", (0, 0, 255))
                     elif self.global_paused:
-                        # User-toggled F12 pause
                         self.hid.stop_all()
-                        self.combat_queue.clear()
+                        if self.is_aiming_bow:
+                            self.hid.press_r()
+                            self.is_aiming_bow = False
                         self._draw_overlay_notice(debug_frame, "PAUSED (User F12 Toggle)", (0, 165, 255))
                     else:
-                        # Active automation loop
+                        # 5. Execute Strict State Hierarchy
                         self._execute_state_machine(frame, debug_frame)
 
-                    # 5. Calculate FPS
+                    # 6. Calculate FPS
                     fps_counter += 1
                     if time.time() - fps_start_time >= 1.0:
                         current_fps = fps_counter / (time.time() - fps_start_time)
                         fps_counter = 0
                         fps_start_time = time.time()
 
-                    # 6. Render HUD, ROIs, and Banners
+                    # 7. Render HUD & Visual Overlays
                     self._draw_hud(debug_frame, current_fps, is_focused)
 
-                    # 7. Show Debug Preview and Live Tuner Mask
                     cv2.imshow("Genshin Assistant Debug", debug_frame)
 
                     # Display Tuner Mask thumbnail in Tuner window
@@ -810,9 +989,9 @@ class GenshinAssistant:
                     )
                     cv2.imshow(TUNER_WINDOW, mask_display)
 
-                    # 8. User Interaction (Hotkeys inside OpenCV window)
+                    # 8. User Interaction
                     key = cv2.waitKey(1) & 0xFF
-                    if key in (ord("q"), ord("Q"), 27):  # Q or ESC
+                    if key in (ord("q"), ord("Q"), 27):
                         print("\n[INFO] Clean exit requested by user.")
                         break
                     elif key in (ord("s"), ord("S")):
@@ -823,95 +1002,42 @@ class GenshinAssistant:
                 self.cleanup()
 
     # ==========================================================================
-    # State Machine Core
+    # Strict State Machine Hierarchy
     # ==========================================================================
     def _execute_state_machine(self, frame: np.ndarray, debug_frame: np.ndarray):
         now = time.time()
 
-        # ----------------------------------------------------------------------
-        # STATE 1: Combat Evaluation (COMBAT_AUTO / COMBAT_MANUAL)
-        # ----------------------------------------------------------------------
-        in_combat, red_pixels, largest_area, enemy_centroid = self.detector.detect_combat_red_hp_bars(frame)
-        self.combat_target_centroid = enemy_centroid
-        self.combat_largest_area = largest_area
-
-        if in_combat:
-            # Handle state transitions into Combat
-            if self.current_state not in (STATE_COMBAT_AUTO, STATE_COMBAT_MANUAL):
-                self.current_state = STATE_COMBAT_AUTO
-                self.combat_start_time = now
-                self.combat_clear_start = 0.0
-                self.combat_queue.clear()
-                self.hid.stop_walk()
-                print(f"[STATE] Entered {STATE_COMBAT_AUTO} (Red HP Bar detected: {red_pixels} px, area: {largest_area:.1f})")
-
-            # 45-Second Safety Fallback check
-            if self.current_state == STATE_COMBAT_AUTO and (now - self.combat_start_time > 45.0):
-                print(f"[STATE] Combat exceeded 45s threshold! Falling back to {STATE_COMBAT_MANUAL}.")
-                self.current_state = STATE_COMBAT_MANUAL
-                self.hid.stop_all()
-                self.combat_queue.clear()
-                play_alert_chime(880, 300)
-
-            # Execute Auto-Combat sequence if in COMBAT_AUTO
-            if self.current_state == STATE_COMBAT_AUTO:
-                self.combat_clear_start = 0.0
-                self._execute_auto_combat_step(now)
-            else:
-                # In COMBAT_MANUAL: hold keys released, await manual resolution
-                self.hid.stop_all()
-
-            return
-
-        elif self.current_state in (STATE_COMBAT_AUTO, STATE_COMBAT_MANUAL):
-            # Enemies not currently detected -> check 2.0-second clear timer
-            if self.combat_clear_start == 0.0:
-                self.combat_clear_start = now
-
-            if now - self.combat_clear_start >= 2.0:
-                print("[STATE] Combat resolved. Returning to Overworld Navigation.")
-                self.hid.stop_all()
-                self.combat_queue.clear()
-                self.is_closing_distance = False
-                self.current_state = STATE_NAVIGATE
-                # Schedule randomized V pulse after 0.4s - 0.9s delay
-                self.pending_v_pulse_time = now + random.uniform(0.4, 0.9)
-            return
+        # Update detected party size dynamically (1 to 4 slots)
+        self.detected_party_size = self.detector.detect_party_size(frame)
 
         # ----------------------------------------------------------------------
-        # STATE 2: Dialogue Mode Evaluation (Minimap disappearance)
+        # HIERARCHY LEVEL 1: DIALOGUE (Strict Top Priority)
         # ----------------------------------------------------------------------
         minimap_present, minimap_score = self.detector.check_minimap_present(frame)
 
         if not minimap_present:
-            # Minimap disappeared -> In cutscene / conversation
+            # Minimap disappeared -> In cutscene / conversation / domain load
+            # NEVER evaluate or enter COMBAT_AUTO or CHEST_LOOT
             if self.current_state != STATE_DIALOGUE:
                 self.current_state = STATE_DIALOGUE
                 print(f"[STATE] Entered {STATE_DIALOGUE} (Minimap hidden, metric: {minimap_score:.3f})")
                 self.hid.stop_all()
-                self.combat_queue.clear()
+                self.hid.release_lmb()
+                self.is_scanning_for_marker = False
                 self.f_prompt_consecutive_frames = 0
                 self.pending_overworld_f_press_time = None
                 self.next_dialogue_f_time = now + dialogue_advance_delay()
+                if self.is_aiming_bow:
+                    self.hid.press_r()
+                    self.is_aiming_bow = False
 
-            # Check for dialogue speech bubble / choice icon
+            # Active Dialogue Progression (advance lines & choices at natural log-normal cadence)
             choice_detected, choice_box = self.detector.check_choice_icon(frame)
             if choice_detected and choice_box:
                 bx, by, bw, bh = choice_box
                 cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
-                cv2.putText(
-                    debug_frame,
-                    "CHOICE ICON",
-                    (bx, by - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (0, 255, 0),
-                    1,
-                )
+                cv2.putText(debug_frame, "CHOICE ICON", (bx, by - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
 
-            # Faster Humanized Dialogue Skipping:
-            # Advance both regular dialogue lines and choice boxes at log-normal cadence
-            # (0.38s - 0.78s + 12% chance of 0.95s - 1.45s pause) with NO sluggish 2.0s cooldown
             if now >= self.next_dialogue_f_time:
                 self.hid.press_f()
                 self.next_dialogue_f_time = now + dialogue_advance_delay()
@@ -920,22 +1046,248 @@ class GenshinAssistant:
             return
 
         # ----------------------------------------------------------------------
-        # STATE 3: Overworld Navigation
+        # HIERARCHY LEVEL 2: COMBAT_AUTO / COMBAT_MANUAL
         # ----------------------------------------------------------------------
-        # If transitioning from DIALOGUE -> OVERWORLD, schedule V pulse
-        if not self.previous_minimap_state and minimap_present:
-            print("[STATE] Transitioned back to Overworld. Scheduling 'V' quest path pulse.")
+        in_combat, red_pixels, largest_area, enemy_centroid, is_elevated = self.detector.detect_combat_red_hp_bars(frame)
+
+        if in_combat:
+            self.combat_clear_start = 0.0
+            self.combat_target_centroid = enemy_centroid
+            self.combat_largest_area = largest_area
+
+            # Stop running immediately upon entering combat!
+            if self.current_state not in (STATE_COMBAT_AUTO, STATE_COMBAT_MANUAL):
+                self.current_state = STATE_COMBAT_AUTO
+                self.combat_start_time = now
+                self.melee_damage_stall_timer = now
+                self.last_enemy_hp_pixels = red_pixels
+                self.is_scanning_for_marker = False
+                self.hid.stop_walk()   # Send W0 immediately
+                self.hid.stop_all()
+                print(f"[STATE] Entered {STATE_COMBAT_AUTO} (Enemies: {red_pixels}px, elevated: {is_elevated})")
+
+            # Check 45s safety cutoff
+            if self.current_state == STATE_COMBAT_AUTO and (now - self.combat_start_time > 45.0):
+                print(f"[STATE] Combat exceeded 45s threshold -> {STATE_COMBAT_MANUAL}")
+                self.current_state = STATE_COMBAT_MANUAL
+                self.hid.stop_all()
+                play_alert_chime(880, 300)
+
+            if self.current_state == STATE_COMBAT_AUTO:
+                self._execute_auto_combat_step(now, is_elevated, red_pixels)
+            else:
+                self.hid.stop_all()
+
+            self.previous_minimap_state = True
+            return
+
+        elif self.current_state in (STATE_COMBAT_AUTO, STATE_COMBAT_MANUAL):
+            # 0 enemy HP bars detected -> wait >= 1.5s before exiting combat
+            if self.combat_clear_start == 0.0:
+                self.combat_clear_start = now
+
+            if now - self.combat_clear_start >= 1.5:
+                print("[STATE] Combat ended (0 HP bars for 1.5s). Resuming overworld.")
+                self.hid.stop_all()
+                if self.is_aiming_bow:
+                    self.hid.press_r()
+                    self.is_aiming_bow = False
+                self.current_state = STATE_NAVIGATE
+                self.pending_v_pulse_time = now + random.uniform(0.4, 0.8)
+
+            self.previous_minimap_state = True
+            return
+
+        # ----------------------------------------------------------------------
+        # HIERARCHY LEVEL 3: CHEST_LOOT
+        # ----------------------------------------------------------------------
+        chest_detected, chest_box, chest_centroid = self.detector.detect_chest(frame)
+        if chest_detected and chest_centroid:
+            self.current_state = STATE_CHEST_LOOT
+            self._execute_chest_loot_step(now, chest_box, chest_centroid, frame, debug_frame)
+            self.previous_minimap_state = True
+            return
+        elif self.current_state == STATE_CHEST_LOOT:
+            self.current_state = STATE_NAVIGATE
+
+        # ----------------------------------------------------------------------
+        # HIERARCHY LEVEL 4: NAVIGATE (with Road-Following & EMA Smoothing)
+        # ----------------------------------------------------------------------
+        self.current_state = STATE_NAVIGATE
+        self._execute_navigate_step(now, frame, debug_frame)
+        self.previous_minimap_state = True
+
+    # ==========================================================================
+    # Slower, Paced Starter Combat & Amber Bow Aiming
+    # ==========================================================================
+    def _execute_auto_combat_step(self, now: float, is_elevated: bool, red_pixels: int):
+        """
+        Executes deliberate, humanized starter combat:
+        - 3-hit LMB combos (0.32-0.58s spacing) + pause/dodge
+        - 6.5-8.5s Elemental Skill (E), 12-15s Burst (Q)
+        - 7.0-10.0s character swaps (only slots 1..detected_party_size)
+        - Amber Aim-Shot mode for elevated (y<290) or stalled (>4s) enemies
+        """
+        # Check damage stall
+        if red_pixels < self.last_enemy_hp_pixels:
+            self.melee_damage_stall_timer = now
+            self.last_enemy_hp_pixels = red_pixels
+        elif now - self.melee_damage_stall_timer > 4.0:
+            is_elevated = True  # Fall back to ranged bow shots if melee is obstructed
+
+        # --- Amber Bow Aiming Mode for Elevated / Ranged Enemies ---
+        amber_slot = 2 if self.detected_party_size >= 2 else 1
+        if is_elevated and self.detected_party_size >= 2:
+            if not self.is_aiming_bow:
+                if self.current_party_slot != amber_slot:
+                    self.hid.select_slot(amber_slot)
+                    self.current_party_slot = amber_slot
+                    self.last_party_swap_time = now
+                    time.sleep(0.4)
+                self.hid.press_r()
+                self.is_aiming_bow = True
+                self.bow_aim_shot_count = 0
+                self.active_combat_action_label = "Amber: Entering Aim Mode [R]"
+                return
+
+            # While in Bow Aim Mode: steer 2-axis reticle toward target torso
+            if self.combat_target_centroid is not None:
+                ecx, ecy = self.combat_target_centroid
+                target_x = ecx
+                target_y = ecy + 35  # aim slightly below red HP bar onto torso/head
+
+                aim_err_x = target_x - 640
+                aim_err_y = target_y - 360
+
+                # 2-Axis mouse steering
+                dx = max(-40, min(40, int(aim_err_x * 0.18)))
+                dy = max(-40, min(40, int(aim_err_y * 0.18)))
+                self.hid.move_mouse(dx, dy)
+
+                # Fire charged Pyro shot when aligned within 24 px
+                if abs(aim_err_x) < 24 and abs(aim_err_y) < 24:
+                    self.active_combat_action_label = f"Amber: Charged Shot ({self.bow_aim_shot_count + 1}/3)"
+                    self.hid.hold_lmb()
+                    time.sleep(1.6)
+                    self.hid.release_lmb()
+                    self.bow_aim_shot_count += 1
+                    time.sleep(0.3)
+
+                    if self.bow_aim_shot_count >= 3:
+                        self.hid.press_r()
+                        self.is_aiming_bow = False
+                        self.melee_damage_stall_timer = now
+                        self.active_combat_action_label = "Amber: Exiting Aim Mode [R]"
+            return
+
+        # If leaving aim mode
+        if self.is_aiming_bow:
+            self.hid.press_r()
+            self.is_aiming_bow = False
+            time.sleep(0.3)
+
+        # Rate limiter for ground combat actions
+        if now < self.combat_step_ready_time:
+            return
+
+        # 1. Deliberate Party Swap (every 7.0 - 10.0s, only within detected party size)
+        if self.detected_party_size > 1 and (now - self.last_party_swap_time >= self.next_party_swap_interval):
+            next_slot = (self.current_party_slot % self.detected_party_size) + 1
+            self.hid.select_slot(next_slot)
+            self.current_party_slot = next_slot
+            self.last_party_swap_time = now
+            self.next_party_swap_interval = random.uniform(7.0, 10.0)
+            self.active_combat_action_label = f"Swap to Slot {next_slot}"
+            self.combat_step_ready_time = now + random.uniform(0.40, 0.60)
+            return
+
+        # 2. Elemental Skill (E) - every 6.5 - 8.5s
+        if now - self.last_skill_e_time >= self.next_skill_e_interval:
+            self.hid.press_e()
+            self.last_skill_e_time = now
+            self.next_skill_e_interval = random.uniform(6.5, 8.5)
+            self.active_combat_action_label = f"Slot {self.current_party_slot}: Skill [E]"
+            self.combat_step_ready_time = now + random.uniform(0.45, 0.70)
+            return
+
+        # 3. Elemental Burst (Q) - every 12.0 - 15.0s
+        if now - self.last_burst_q_time >= self.next_burst_q_interval:
+            self.hid.press_q()
+            self.last_burst_q_time = now
+            self.next_burst_q_interval = random.uniform(12.0, 15.0)
+            self.active_combat_action_label = f"Slot {self.current_party_slot}: Burst [Q]"
+            self.combat_step_ready_time = now + random.uniform(0.55, 0.85)
+            return
+
+        # 4. 3-Hit Normal Attack Combos (0.32 - 0.58s spacing) + Pause / Dodge
+        if self.combat_combo_hit_count < 3:
+            self.hid.click_lmb()
+            self.combat_combo_hit_count += 1
+            self.active_combat_action_label = f"Normal Attack ({self.combat_combo_hit_count}/3)"
+            self.combat_step_ready_time = now + random.uniform(0.32, 0.58)
+        else:
+            self.combat_combo_hit_count = 0
+            if random.random() < 0.35:
+                self.hid.click_rmb()
+                self.active_combat_action_label = "Reposition: Dodge [RMB]"
+                self.combat_step_ready_time = now + random.uniform(0.50, 0.75)
+            else:
+                self.active_combat_action_label = "Combo Recovery Pause"
+                self.combat_step_ready_time = now + random.uniform(0.45, 0.75)
+
+    # ==========================================================================
+    # Automatic Chest Detection & Looting
+    # ==========================================================================
+    def _execute_chest_loot_step(
+        self,
+        now: float,
+        chest_box: Tuple[int, int, int, int],
+        chest_centroid: Tuple[int, int],
+        frame: np.ndarray,
+        debug_frame: np.ndarray,
+    ):
+        """Walk up to spotted chests, stop on [F] prompt, open, and collect loot drops."""
+        self.active_chest_box = chest_box
+        cx, cy = chest_centroid
+        error_x = cx - 640
+
+        # Draw chest box on debug frame
+        bx, by, bw, bh = chest_box
+        cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (0, 165, 255), 2)
+        cv2.putText(debug_frame, "CHEST SPOTTED", (bx, by - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 165, 255), 2)
+
+        # Check for interaction [F] prompt
+        f_prompt_detected, prompt_box = self.detector.detect_overworld_f_prompt(frame)
+        if f_prompt_detected or cy >= 440:
+            # Reached chest: stop walking and open!
+            self.hid.stop_walk()
+            print("[CHEST] Reached chest: opening & looting drops.")
+            self.hid.press_f()
+            time.sleep(0.30)
+            # Tap [F] 2-3 times to collect dropped items
+            for _ in range(random.randint(2, 3)):
+                self.hid.press_f()
+                time.sleep(0.25)
+            self.active_chest_box = None
+            self.current_state = STATE_NAVIGATE
+        else:
+            # Steer toward chest and walk forward
+            self._apply_humanized_steering(error_x, now)
+            self.hid.start_walk()
+
+    # ==========================================================================
+    # Overworld Navigation (with Minimap Road-Following & EMA Smoothing)
+    # ==========================================================================
+    def _execute_navigate_step(self, now: float, frame: np.ndarray, debug_frame: np.ndarray):
+        # 1. Transition V pulse from Dialogue
+        if not self.previous_minimap_state:
             self.pending_v_pulse_time = now + random.uniform(0.3, 0.6)
 
-        self.previous_minimap_state = True
-        self.current_state = STATE_NAVIGATE
-
-        # Dispatch pending V pulse if ready
         if self.pending_v_pulse_time and now >= self.pending_v_pulse_time:
             self.hid.press_v()
             self.pending_v_pulse_time = None
 
-        # 1. Overworld [F] Prompt Detection (Statues of the Seven, Waypoints, Items, Doors, NPCs)
+        # 2. Overworld [F] Prompt Detection (Statues, Waypoints, Items, NPCs)
         f_prompt_detected, prompt_box = self.detector.detect_overworld_f_prompt(frame)
         if f_prompt_detected and prompt_box:
             self.f_prompt_consecutive_frames += 1
@@ -943,14 +1295,12 @@ class GenshinAssistant:
             if self.f_prompt_consecutive_frames >= 2:
                 self.show_overworld_f_box_until = now + 1.2
                 if (now - self.last_overworld_f_time >= self.overworld_f_cooldown) and (self.pending_overworld_f_press_time is None):
-                    # Stop walking past the object
                     if self.hid.is_walking:
                         self.hid.stop_walk()
                     self.pending_overworld_f_press_time = now + random.uniform(0.15, 0.28)
         else:
             self.f_prompt_consecutive_frames = 0
 
-        # Dispatch pending overworld [F] interaction after reaction delay
         if self.pending_overworld_f_press_time is not None and now >= self.pending_overworld_f_press_time:
             print("[OVERWORLD] [F] Prompt confirmed: interacting.")
             self.hid.press_f()
@@ -958,11 +1308,30 @@ class GenshinAssistant:
             self.overworld_f_cooldown = random.uniform(1.4, 2.1)
             self.pending_overworld_f_press_time = None
 
-        # 2. Ground motion calculation (stuck detection)
+        # 3. Ground Motion Differencing (Stuck / Cliff Detection)
         raw_motion, self.prev_ground_gray = self.detector.calculate_ground_motion(frame, self.prev_ground_gray)
         self.smooth_motion_score = 0.75 * self.smooth_motion_score + 0.25 * raw_motion
 
-        # 3. Track Gold Quest Marker
+        # Vertical Jump / Obstacle Unstuck check: if motion < 1.05 for > 1.8s while walking
+        if self.hid.is_walking and self.smooth_motion_score < 1.05:
+            if self.unstuck_still_start_time == 0.0:
+                self.unstuck_still_start_time = now
+            elif now - self.unstuck_still_start_time > 1.8:
+                if now - self.last_lateral_unstuck_time > 2.0:
+                    print("[UNSTUCK] Obstacle detected: pulsing SPACE jump & lateral steering.")
+                    self.hid.press_space()
+                    lateral_dx = 65 if random.random() < 0.5 else -65
+                    self.hid.move_mouse(lateral_dx, 0)
+                    self.last_lateral_unstuck_time = now
+                    self.unstuck_still_start_time = 0.0
+        else:
+            self.unstuck_still_start_time = 0.0
+
+        # 4. Minimap Road-Following Angle Analysis
+        quest_bearing, road_bearing, has_road = self.detector.analyze_minimap_road_and_quest(frame)
+        self.active_road_following = has_road
+
+        # 5. Track Gold Quest Marker in Central ROI
         centroid, _ = self.detector.track_gold_quest_marker(frame, self.config)
 
         if centroid is not None:
@@ -976,21 +1345,31 @@ class GenshinAssistant:
             cv2.line(debug_frame, (cx - 15, cy), (cx + 15, cy), (0, 215, 255), 2)
             cv2.line(debug_frame, (cx, cy - 15), (cx, cy + 15), (0, 215, 255), 2)
 
-            # Steering calculation: error_x relative to screen center (640)
-            error_x = cx - 640
-            cv2.arrowedLine(debug_frame, (640, cy), (cx, cy), (0, 255, 255), 2, tipLength=0.2)
+            raw_error_x = cx - 640
 
-            # Remember sweep direction based on current marker error
-            if error_x > 20:
+            # Bias error_x toward road if road exists within +/- 55 deg
+            if has_road and road_bearing is not None:
+                # Convert road angle into equivalent screen horizontal offset
+                road_offset_x = road_bearing * (640.0 / (math.pi / 2.5))
+                effective_error_x = 0.45 * raw_error_x + 0.55 * road_offset_x
+            else:
+                effective_error_x = float(raw_error_x)
+
+            # Exponential Moving Average (EMA, alpha=0.35) for smooth camera panning
+            alpha = float(self.config.get("steer_ema_alpha", 0.35))
+            self.ema_error_x = (1.0 - alpha) * self.ema_error_x + alpha * effective_error_x
+
+            # Update sweep direction
+            if raw_error_x > 20:
                 self.scan_sweep_direction = 1
-            elif error_x < -20:
+            elif raw_error_x < -20:
                 self.scan_sweep_direction = -1
 
-            # Humanized Noisy Camera Steering with 22px Deadzone
-            self._apply_humanized_steering(error_x, now)
+            # Humanized Noisy Camera Steering with 22px Deadzone & 15-20Hz Rate Limiting
+            self._apply_humanized_steering(int(self.ema_error_x), now)
 
             # Hard Turn Check: if abs(error_x) > 160 px, pause walking while turning camera hard
-            is_hard_turning = abs(error_x) > 160
+            is_hard_turning = abs(raw_error_x) > 160
             if is_hard_turning:
                 if self.hid.is_walking:
                     self.hid.stop_walk()
@@ -998,11 +1377,9 @@ class GenshinAssistant:
                 # Normal forward navigation
                 walk_time = now - self.hid.walk_start_time if self.hid.is_walking else 0.0
                 if self.hid.is_walking and walk_time > 2.5 and self.smooth_motion_score < 1.05:
-                    # Character is stuck against rock / tree / cliff
                     self.hid.stop_all()
                     self.is_stuck_alert = True
                     play_alert_chime(880, 220)
-                    print(f"[STUCK] Low ground motion ({self.smooth_motion_score:.2f}) while walking. STOP sent!")
                 elif not self.is_stuck_alert and (self.pending_overworld_f_press_time is None):
                     self.hid.start_walk()
 
@@ -1012,7 +1389,7 @@ class GenshinAssistant:
                         self.last_sprint_time = now
                         self.next_sprint_interval = random.uniform(2.1, 3.8)
 
-                    # Lightweight keepalive: re-send W1 every 4.0s if no other command was sent in that window
+                    # Firmware Keepalive: re-send W1 every 4.0s if no other command was sent in that window
                     if self.hid.is_walking and (now - self.hid.last_command_time >= 4.0):
                         self.hid.send_command("W1")
 
@@ -1020,225 +1397,53 @@ class GenshinAssistant:
             # Gold quest marker not visible in central ROI
             time_lost = now - self.marker_last_seen_time
             if time_lost > 1.2:
-                # Stop walking forward blindly
                 if self.hid.is_walking:
                     self.hid.stop_walk()
 
                 self.is_scanning_for_marker = True
 
-                # Lost-Marker Camera Scan:
-                # Perform humanized slow horizontal camera sweep (22-36 px bursts every 0.18s-0.32s)
+                # Lost-Marker Camera Scan: Horizontal sweep bursts (22-36 px every 0.18-0.32s)
                 if now - self.last_scan_sweep_time >= self.next_scan_sweep_interval:
                     burst_dx = random.randint(22, 36) * self.scan_sweep_direction
-                    self.hid.move_mouse(burst_dx)
+                    self.hid.move_mouse(burst_dx, 0)
                     self.last_scan_sweep_time = now
                     self.next_scan_sweep_interval = random.uniform(0.18, 0.32)
 
     # ==========================================================================
-    # Humanized Camera Steering Logic
+    # Smooth, Rate-Limited Camera Steering
     # ==========================================================================
     def _apply_humanized_steering(self, error_x: int, now: float):
         """
-        Applies throttled, noisy camera steering with a horizontal center deadzone (22px).
-        Clamps steering to [-45, 45] with Gaussian noise and slight human overshoot.
+        Applies smoothed, rate-limited (15-20 Hz) camera steering with a 22px deadzone.
+        Clamps steering to [-45, 45] with Gaussian noise and human overshoot.
         """
         # Horizontal center deadzone: within 22px, no steering adjustment
         if abs(error_x) < 22:
             return
 
-        # Throttle steering updates to randomized intervals (0.12s - 0.28s)
-        if now - self.last_steer_time < self.next_steer_interval:
+        # Rate-limit mouse steering packets to max 15-20 Hz (>= 0.055s spacing)
+        if now - self.last_mouse_packet_time < 0.055:
             return
 
         kp = max(0.01, float(self.config["Kp_x100"]) / 100.0)
 
-        # Gaussian noise (mean 0, sigma 2.0) and slight human overshoot (0.85 - 1.15x)
         noise = random.gauss(0, 2.0)
         overshoot = random.uniform(0.85, 1.15)
         raw_dx = (error_x * (kp * overshoot)) + noise
         steer_dx = max(-45, min(45, int(raw_dx)))
 
-        self.hid.move_mouse(steer_dx)
-
-        self.last_steer_time = now
-        self.next_steer_interval = random.uniform(0.12, 0.28)
-
-    # ==========================================================================
-    # Starter-Roster Stochastic Auto-Combat
-    # ==========================================================================
-    def _execute_auto_combat_step(self, now: float):
-        """
-        Non-blocking step execution for stochastic starter-roster combat.
-        Supports 1 to 4 unlocked characters with dynamic cycle generation.
-        """
-        # 1. Close distance if red HP bar is small (< 280 px area)
-        if self.combat_largest_area > 0 and self.combat_largest_area < 280:
-            if not self.is_closing_distance:
-                # Pulse forward walk for 0.35s - 0.55s
-                pulse_duration = random.uniform(0.35, 0.55)
-                self.hid.start_walk()
-                self.is_closing_distance = True
-                self.close_distance_finish_time = now + pulse_duration
-                self.active_combat_action_label = "Closing Distance (W1)"
-                return
-
-        if self.is_closing_distance:
-            if now >= self.close_distance_finish_time:
-                self.hid.stop_walk()
-                self.is_closing_distance = False
-            return
-
-        # 2. Steer camera toward target if enemy centroid is available
-        if self.combat_target_centroid is not None:
-            enemy_error_x = self.combat_target_centroid[0] - 640
-            self._apply_humanized_steering(enemy_error_x, now)
-
-        # 3. Generate a fresh randomized combat cycle if queue is empty
-        if not self.combat_queue:
-            self._generate_stochastic_combat_cycle()
-
-        # 4. Execute the next non-blocking combat step
-        if now >= self.combat_step_ready_time and self.combat_queue:
-            step = self.combat_queue.pop(0)
-            self.active_combat_action_label = step.get("label", "Combat Action")
-            step_type = step.get("type", "CMD")
-
-            if step_type == "SLOT":
-                self.hid.select_slot(step["slot"])
-            elif step_type == "SKILL":
-                self.hid.press_e()
-            elif step_type == "BURST":
-                self.hid.press_q()
-            elif step_type == "ATTACK":
-                self.hid.click_lmb()
-            elif step_type == "CHARGED_START":
-                self.hid.hold_lmb()
-            elif step_type == "CHARGED_FINISH":
-                self.hid.release_lmb()
-            elif step_type == "DASH":
-                self.hid.click_rmb()
-            elif step_type == "JUMP":
-                self.hid.press_space()
-            elif step_type == "STOP":
-                self.hid.stop_all()
-
-            # Schedule next step execution
-            self.combat_step_ready_time = now + step.get("delay", human_delay())
-
-    def _generate_stochastic_combat_cycle(self):
-        """
-        Dynamically generates a randomized starter-roster combat sequence:
-        - Slot 1 (E, 40% Q, 2-5 LMB or 20% charged attack)
-        - Shuffled remaining slots [2, 3, 4] (E 85%, Q 35%, 1-4 LMB)
-        - 15% chance to inject a repositioning Dash (RMB) or Jump (SPACE)
-        """
-        # --- Part A: Slot 1 Sequence (Main DPS / Starter Traveler) ---
-        self.combat_queue.append({
-            "type": "SLOT",
-            "slot": 1,
-            "label": "Slot 1 (Select)",
-            "delay": human_delay(0.24, 0.35, 0.16, 0.42, allow_micro_pause=False),
-        })
-
-        # Elemental Skill (E)
-        self.combat_queue.append({
-            "type": "SKILL",
-            "label": "Slot 1: Skill [E]",
-            "delay": human_delay(0.26, 0.35, 0.18, 0.48, allow_micro_pause=False),
-        })
-
-        # 40% probability for Elemental Burst (Q)
-        if random.random() < 0.40:
-            self.combat_queue.append({
-                "type": "BURST",
-                "label": "Slot 1: Burst [Q]",
-                "delay": human_delay(0.32, 0.35, 0.22, 0.58, allow_micro_pause=False),
-            })
-
-        # 20% chance of 0.6s Charged Attack, otherwise 2-5 normal attacks
-        if random.random() < 0.20:
-            self.combat_queue.append({
-                "type": "CHARGED_START",
-                "label": "Slot 1: Charged Atk (Hold)",
-                "delay": 0.60,
-            })
-            self.combat_queue.append({
-                "type": "CHARGED_FINISH",
-                "label": "Slot 1: Charged Atk (Release)",
-                "delay": human_delay(0.22, 0.30, 0.15, 0.40, allow_micro_pause=False),
-            })
-        else:
-            num_hits = random.randint(2, 5)
-            for i in range(num_hits):
-                self.combat_queue.append({
-                    "type": "ATTACK",
-                    "label": f"Slot 1: Normal Atk ({i+1}/{num_hits})",
-                    "delay": human_delay(0.20, 0.30, 0.14, 0.38, allow_micro_pause=False),
-                })
-
-        # --- Part B: Shuffle Remaining Party Slots (AR 1-10 Friendly) ---
-        # Select 2 to 3 slots from [2, 3, 4] in randomized order
-        k_slots = random.randint(2, 3)
-        shuffled_slots = random.sample([2, 3, 4], k=k_slots)
-
-        for slot_num in shuffled_slots:
-            # Slot switch
-            self.combat_queue.append({
-                "type": "SLOT",
-                "slot": slot_num,
-                "label": f"Slot {slot_num} (Select)",
-                "delay": human_delay(0.28, 0.35, 0.18, 0.45, allow_micro_pause=False),
-            })
-
-            # 85% probability for Elemental Skill (E)
-            if random.random() < 0.85:
-                self.combat_queue.append({
-                    "type": "SKILL",
-                    "label": f"Slot {slot_num}: Skill [E]",
-                    "delay": human_delay(0.25, 0.35, 0.18, 0.50, allow_micro_pause=False),
-                })
-
-            # 35% probability for Elemental Burst (Q)
-            if random.random() < 0.35:
-                self.combat_queue.append({
-                    "type": "BURST",
-                    "label": f"Slot {slot_num}: Burst [Q]",
-                    "delay": human_delay(0.30, 0.35, 0.20, 0.55, allow_micro_pause=False),
-                })
-
-            # 1 to 4 Normal Attacks
-            num_attacks = random.randint(1, 4)
-            for j in range(num_attacks):
-                self.combat_queue.append({
-                    "type": "ATTACK",
-                    "label": f"Slot {slot_num}: Atk ({j+1}/{num_attacks})",
-                    "delay": human_delay(0.20, 0.30, 0.14, 0.38, allow_micro_pause=False),
-                })
-
-        # --- Part C: Natural Repositioning (15% chance per cycle) ---
-        if random.random() < 0.15:
-            if random.random() < 0.60:
-                self.combat_queue.append({
-                    "type": "DASH",
-                    "label": "Reposition: Dash [RMB]",
-                    "delay": human_delay(0.35, 0.35, 0.22, 0.65, allow_micro_pause=True),
-                })
-            else:
-                self.combat_queue.append({
-                    "type": "JUMP",
-                    "label": "Reposition: Jump [SPACE]",
-                    "delay": human_delay(0.35, 0.35, 0.22, 0.65, allow_micro_pause=True),
-                })
+        self.hid.move_mouse(steer_dx, 0)
+        self.last_mouse_packet_time = now
 
     # ==========================================================================
     # Visual HUD & Overlay Rendering
     # ==========================================================================
     def _draw_hud(self, debug_frame: np.ndarray, fps: float, is_focused: bool):
         """Draw bounding boxes, telemetry stats, and hotkey banners on debug frame."""
-        # 1. Minimap ROI (Cyan)
-        my1, my2, mx1, mx2 = ROI_MINIMAP
-        cv2.rectangle(debug_frame, (mx1, my1), (mx2, my2), (255, 255, 0), 1)
-        cv2.putText(debug_frame, "Minimap ROI", (mx1 + 5, my2 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+        # 1. Minimap Circle ROI (Cyan)
+        cv2.circle(debug_frame, MINIMAP_CENTER, MINIMAP_RADIUS, (255, 255, 0), 1)
+        road_tag = "Road: ON" if self.active_road_following else "Road: OFF"
+        cv2.putText(debug_frame, road_tag, (MINIMAP_CENTER[0] - 28, MINIMAP_CENTER[1] + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 0), 1)
 
         # 2. Navigation ROI (Yellow)
         ny1, ny2, nx1, nx2 = ROI_NAV
@@ -1265,27 +1470,31 @@ class GenshinAssistant:
         cv2.rectangle(debug_frame, (ix1, iy1), (ix2, iy2), (180, 180, 0), 1)
         cv2.putText(debug_frame, "Interact ROI", (ix1 + 5, iy1 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 0), 1)
 
+        # 7. Party Portrait Stack ROI
+        py1, py2, px1, px2 = ROI_PARTY
+        cv2.rectangle(debug_frame, (px1, py1), (px2, py2), (140, 100, 220), 1)
+        cv2.putText(debug_frame, f"Party: {self.detected_party_size} Slots", (px1 - 25, py1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 100, 220), 1)
+
         # Draw Overworld [F] Prompt Box (Cyan)
         if (time.time() < self.show_overworld_f_box_until or self.f_prompt_consecutive_frames >= 2) and self.f_prompt_box:
             bx, by, bw, bh = self.f_prompt_box
             cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (255, 255, 0), 2)
-            cv2.putText(
-                debug_frame,
-                "OVERWORLD [F]",
-                (bx - 10, by - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 0),
-                2,
-            )
+            cv2.putText(debug_frame, "OVERWORLD [F]", (bx - 10, by - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
-        # Draw enemy centroid if available
+        # Draw Chest Box if active
+        if self.active_chest_box:
+            bx, by, bw, bh = self.active_chest_box
+            cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (0, 165, 255), 2)
+            cv2.putText(debug_frame, "CHEST LOOT", (bx, by - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2)
+
+        # Draw enemy centroid if in combat
         if self.combat_target_centroid is not None and self.current_state in (STATE_COMBAT_AUTO, STATE_COMBAT_MANUAL):
             ecx, ecy = self.combat_target_centroid
             cv2.drawMarker(debug_frame, (ecx, ecy), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 16, 2)
+            elevated_tag = " [ELEVATED]" if ecy < 290 else ""
             cv2.putText(
                 debug_frame,
-                f"TARGET ({int(self.combat_largest_area)}px)",
+                f"TARGET ({int(self.combat_largest_area)}px){elevated_tag}",
                 (ecx - 40, ecy - 12),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.45,
@@ -1296,7 +1505,6 @@ class GenshinAssistant:
         # Top Information Banner
         cv2.rectangle(debug_frame, (0, 0), (TARGET_WIDTH, 36), (20, 20, 20), -1)
 
-        # State color badge
         state_color = (0, 255, 0)
         if self.current_state == STATE_COMBAT_AUTO:
             state_color = (0, 100, 255)
@@ -1304,6 +1512,8 @@ class GenshinAssistant:
             state_color = (0, 0, 255)
         elif self.current_state == STATE_DIALOGUE:
             state_color = (255, 180, 0)
+        elif self.current_state == STATE_CHEST_LOOT:
+            state_color = (0, 165, 255)
 
         cv2.putText(
             debug_frame,
@@ -1315,12 +1525,14 @@ class GenshinAssistant:
             2,
         )
 
-        # Middle telemetry info
+        # Telemetry info
         if self.current_state == STATE_COMBAT_AUTO:
             elapsed = time.time() - self.combat_start_time
-            queue_len = len(self.combat_queue)
-            telemetry_text = f"Combat: {elapsed:.1f}s/45s | Action: {self.active_combat_action_label} (Q:{queue_len})"
-            cv2.putText(debug_frame, telemetry_text, (290, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 255), 1)
+            aim_tag = " [AIM-SHOT]" if self.is_aiming_bow else ""
+            telemetry_text = f"Combat: {elapsed:.1f}s/45s | Slot {self.current_party_slot}/{self.detected_party_size} | {self.active_combat_action_label}{aim_tag}"
+            cv2.putText(debug_frame, telemetry_text, (270, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 220, 255), 1)
+        elif self.current_state == STATE_CHEST_LOOT:
+            cv2.putText(debug_frame, "Approaching & Opening Chest...", (320, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 165, 255), 2)
         else:
             walk_label = "WALK [W1]" if self.hid.is_walking else "IDLE"
             walk_color = (0, 255, 0) if self.hid.is_walking else (160, 160, 160)
@@ -1351,54 +1563,22 @@ class GenshinAssistant:
         # Config Saved notification
         if time.time() < self.save_banner_until:
             cv2.rectangle(debug_frame, (500, 50), (780, 95), (0, 140, 0), -1)
-            cv2.putText(
-                debug_frame,
-                "CONFIG SAVED!",
-                (535, 82),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.75,
-                (255, 255, 255),
-                2,
-            )
+            cv2.putText(debug_frame, "CONFIG SAVED!", (535, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
         # Stuck Alert Banner
         if self.is_stuck_alert:
             cv2.rectangle(debug_frame, (420, 120), (860, 170), (0, 0, 200), -1)
-            cv2.putText(
-                debug_frame,
-                "OBSTACLE / STUCK DETECTED!",
-                (445, 155),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.75,
-                (255, 255, 255),
-                2,
-            )
+            cv2.putText(debug_frame, "OBSTACLE / STUCK DETECTED!", (445, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
         # Off-Screen Quest Marker Scan Banner
         if self.is_scanning_for_marker and self.current_state == STATE_NAVIGATE:
             cv2.rectangle(debug_frame, (430, 80), (850, 118), (0, 120, 255), -1)
-            cv2.putText(
-                debug_frame,
-                "SCANNING FOR QUEST MARKER...",
-                (450, 107),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.60,
-                (255, 255, 255),
-                2,
-            )
+            cv2.putText(debug_frame, "SCANNING FOR QUEST MARKER...", (450, 107), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
 
         # Combat Manual Timeout Banner
         if self.current_state == STATE_COMBAT_MANUAL:
             cv2.rectangle(debug_frame, (320, 110), (960, 165), (0, 0, 180), -1)
-            cv2.putText(
-                debug_frame,
-                "COMBAT TIMEOUT (>45s) - MANUAL TAKEOVER",
-                (345, 145),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (255, 255, 255),
-                2,
-            )
+            cv2.putText(debug_frame, "COMBAT TIMEOUT (>45s) - MANUAL TAKEOVER", (345, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
     def _draw_overlay_notice(self, frame: np.ndarray, text: str, color: Tuple[int, int, int]):
         """Draw semi-transparent overlay to indicate safe paused state."""
@@ -1406,22 +1586,16 @@ class GenshinAssistant:
         cv2.rectangle(overlay, (0, 0), (TARGET_WIDTH, TARGET_HEIGHT), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
-        # Center banner
         cv2.rectangle(frame, (240, 310), (1040, 410), (20, 20, 20), -1)
         cv2.rectangle(frame, (240, 310), (1040, 410), color, 3)
-        cv2.putText(
-            frame,
-            text,
-            (TARGET_WIDTH // 2 - 280, 370),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.95,
-            color,
-            2,
-        )
+        cv2.putText(frame, text, (TARGET_WIDTH // 2 - 280, 370), cv2.FONT_HERSHEY_SIMPLEX, 0.95, color, 2)
 
     def cleanup(self):
         """Emergency stop inputs, disconnect serial, and close OpenCV windows."""
         print("[CLEANUP] Stopping HID inputs and releasing resources...")
+        if self.is_aiming_bow:
+            self.hid.press_r()
+            self.is_aiming_bow = False
         self.hid.close()
         cv2.destroyAllWindows()
         print("[CLEANUP] Genshin Assistant terminated safely.")
@@ -1431,7 +1605,7 @@ class GenshinAssistant:
 # CLI Entrypoint
 # ==============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Genshin Impact CV Automation with ESP32-S3 HID (v2 Auto-Combat)")
+    parser = argparse.ArgumentParser(description="Genshin Impact CV Automation with ESP32-S3 HID (v3 Overhaul)")
     parser.add_argument("--port", type=str, default="COM4", help="Serial COM port of ESP32-S3 (default: COM4)")
     parser.add_argument(
         "--dry-run",

@@ -5,5 +5,7 @@
   "S_max": 255,
   "V_min": 180,
   "V_max": 255,
-  "Kp_x100": 14
+  "Kp_x100": 14,
+  "steer_ema_alpha": 0.35,
+  "road_following_enabled": true
 }

@@ -100,6 +100,22 @@ class HIDTester:
         time.sleep(0.3)
         print("    [DONE] Skills E and Q dispatched.")
 
+    def test_aim_mode(self):
+        print("[>] Testing Bow Aim Mode 'R'...")
+        self.send_raw("R")
+        time.sleep(0.3)
+        print("    [DONE] Aim Mode 'R' dispatched.")
+
+    def test_2axis_mouse(self):
+        print("[>] Testing 2-Axis Mouse Movement (M<dx>,<dy>)...")
+        for _ in range(3):
+            self.send_raw("M15,-10")
+            time.sleep(0.05)
+        for _ in range(3):
+            self.send_raw("M-15,10")
+            time.sleep(0.05)
+        print("    [DONE] 2-Axis diagonal mouse motions dispatched.")
+
     def test_mouse_clicks(self):
         print("[>] Testing Left Mouse Click (LMB) and Right Mouse Click (RMB)...")
         print("    Sending LMB (Normal Attack)...")
@@ -185,8 +201,10 @@ class HIDTester:
         self.test_character_slots()
         time.sleep(0.5)
 
-        # 4. Combat Skills E & Q
+        # 4. Combat Skills E & Q & R
         self.test_combat_skills()
+        time.sleep(0.5)
+        self.test_aim_mode()
         time.sleep(0.5)
 
         # 5. Jump (Space)
@@ -230,17 +248,18 @@ def interactive_menu(tester: HIDTester):
         print("  [2] Test Dialogue 'F' & Quest 'V'")
         print("  [3] Test Character Slots 1-4")
         print("  [4] Test Combat Skills 'E' & 'Q'")
-        print("  [5] Test Left Click (LMB) & Right Click (RMB)")
-        print("  [6] Test Charged Attack (LMB_HOLD -> LMB_REL)")
-        print("  [7] Test Jump (SPACE)")
-        print("  [8] Test Walk Hold 'W1' (1.5s) -> 'W0'")
-        print("  [9] Test Mouse Horizontal Steering (M<dx>)")
+        print("  [5] Test Aim Mode 'R' (Bow)")
+        print("  [6] Test Left Click (LMB) & Right Click (RMB)")
+        print("  [7] Test Charged Attack (LMB_HOLD -> LMB_REL)")
+        print("  [8] Test Jump (SPACE)")
+        print("  [9] Test Walk Hold 'W1' (1.5s) -> 'W0'")
+        print("  [0] Test 2-Axis Mouse Steering (M<dx>,<dy>)")
         print("  [a] Run Full Automated Test Suite")
         print("  [s] Send STOP (Release All Keys & Buttons)")
         print("  [q] Quit")
         print("-------------------------------------------")
 
-        choice = input("Enter option [1-9, a, s, q]: ").strip().lower()
+        choice = input("Enter option [0-9, a, s, q]: ").strip().lower()
         if choice == "1":
             tester.test_ping()
         elif choice == "2":
@@ -252,15 +271,17 @@ def interactive_menu(tester: HIDTester):
         elif choice == "4":
             tester.test_combat_skills()
         elif choice == "5":
-            tester.test_mouse_clicks()
+            tester.test_aim_mode()
         elif choice == "6":
-            tester.test_charged_attack()
+            tester.test_mouse_clicks()
         elif choice == "7":
-            tester.test_jump_space()
+            tester.test_charged_attack()
         elif choice == "8":
-            tester.test_walk_hold()
+            tester.test_jump_space()
         elif choice == "9":
-            tester.test_mouse_wiggle()
+            tester.test_walk_hold()
+        elif choice == "0":
+            tester.test_2axis_mouse()
         elif choice == "a":
             tester.run_automated_suite()
         elif choice == "s":
