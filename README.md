@@ -46,9 +46,9 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
      - **Amber Bow Aim-Shot Mode:** Automatically swaps to Amber (slot 2) and enters Aim Mode (`R`) when fighting elevated/tower enemies or when melee damage stalls (> 4.0s). Tracks reticle with 2-axis mouse steering (`M<dx>,<dy>`) and looses charged Pyro shots (`LMB_HOLD` 1.6s).
      - **Combat Lock:** Prevents navigation sweeps and walking until all enemy HP bars are cleared for >= 1.5s.
      - **Manual Fallback:** After 45s of unresolved combat, alerts the player and yields control.
-   - **State 3 — Chest Looting (`CHEST_LOOT`):**
-     - Detects glowing rings and wooden chest contours in the central overworld viewport (`area: 400..6500 px`).
-     - Aligns camera, steps forward (`W1`), halts (`W0`), and dispatches primary `F` plus rapid multi-tap `F` sweeps (2–3 presses) to vacuum up dropped artifacts, mora, and weapons.
+   - **State 3 — Chest Looting & Multi-Second Vacuum (`CHEST_LOOT`):**
+     - **High-Confidence Sealed Ring Detection:** Detects only high-saturation glowing crimson (`H: 0..8` / `172..180`, `S: 175..255`, `V: 170..255`) or anemo-teal (`H: 82..98`, `S: 160..255`, `V: 170..255`) circular lock rings in a tighter mid-screen ROI (`x: 300..980, y: 220..560`) with aspect ratio filtering (`0.70..1.35`, area `350..3200 px`). Broad terrain/brown color guessing has been removed to eliminate false positives on Mondstadt dirt paths and rocks.
+     - **Multi-Second Loot Vacuum:** Upon opening a chest or triggering an overworld `[F]` prompt, halts movement (`W0`), waits 0.65s for the chest lid opening animation and scattered drops to hit the ground, and enters a 2.2s–2.8s vacuum burst tapping `F` every 0.16s–0.24s (10–14 taps total) while executing a gentle left/right camera wiggle (`M-18,0` $\rightarrow$ `M36,0` $\rightarrow$ `M-18,0`). Continues draining stacked item drop lists until the `[F]` prompt box is cleared.
    - **State 4 — Overworld Navigation (`NAVIGATE`):**
      - **Minimap Road-Following:** Segments dirt roads and paths within the circular minimap, calculating path centerline bearing. Biases movement towards roads when within $\pm 55^\circ$ of quest target.
      - **Smoothed Camera Steering:** Camera mouse steering uses Exponential Moving Average (EMA, $\alpha=0.35$) with rate limiting (max 15–20 Hz) to eliminate micro-stutter.
@@ -58,6 +58,7 @@ Direct screen capture is handled via Python (`mss` + OpenCV), and all keyboard a
      - **Overworld [F] Prompt Interaction:** Interacts with Waypoints, Statues, items, and NPCs.
 5. **Firmware Hardware TRNG & Extended Watchdog:** ESP32-S3 uses true hardware random numbers (`esp_random()`) and a 15-second watchdog timer, complemented by 4-second Python navigation keepalive pings.
 6. **Live HSV & Gain Tuner:** Real-time OpenCV sliders for `H_min`, `H_max`, `S_min`, `S_max`, `V_min`, `V_max`, and proportional steering gain `Kp_x100`, saved to `config.json` with the `S` key.
+7. **Capture & Processing FPS Optimization:** Computes optical flow / unstuck differencing and sealed-chest ring masks on a downscaled `0.5x` frame (`640x360`), runs unstuck motion checks only every 3rd frame (`frame_idx % 3 == 0`), and throttles `cv2.imshow` GUI rendering to max 20 FPS while keeping the direct screen capture and HID control loop executing at full hardware speed.
 
 ---
 

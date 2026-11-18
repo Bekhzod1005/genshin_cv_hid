@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-Genshin Impact Hardware-Assisted Computer Vision Automation (v3 Overhaul)
-========================================================================
+Genshin Impact Hardware-Assisted Computer Vision Automation (v3.1 Optimized)
+============================================================================
 Architecture:
 - Screen Capture: mss (direct desktop / client-rect capture normalized to 1280x720)
 - Hardware Input: ESP32-S3 Microcontroller running TinyUSB HID Keyboard & 2-Axis Mouse
 - Strict State Hierarchy:
-    1. DIALOGUE      : Minimap hidden -> Strict top priority, halts all combat/movement,
+    1. DIALOGUE      : Minimap hidden -> Strict top priority, halts all combat/movement/loot,
                        runs natural log-normal dialogue & choice progression.
     2. COMBAT_AUTO   : Red HP bar detected -> Instant W0 halt (no sprinting past enemies),
                        humanized paced combat (3-hit combo, 6.5-8.5s E, 12-15s Q, 7-10s swap),
                        dynamic party size (1-4 slots), and Amber Aim-Shot mode for elevated/stalled targets.
-    3. CHEST_LOOT    : Overworld sealed-ring / wooden-gold chest detection -> walk to chest,
-                       stop on [F] prompt, open, and multi-tap [F] to collect item drops.
+    3. CHEST_LOOT    : High-confidence sealed chest ring or overworld [F] loot trigger ->
+                       halts movement (W0), opens chest, waits 0.65s lid animation, enters 2.2-2.8s
+                       multi-tap [F] vacuum burst with left/right camera wiggle, and drains stacked loot drops.
     4. NAVIGATE      : Minimap road-following (tracks Mondstadt dirt/stone paths around cliffs),
                        EMA camera smoothing (alpha=0.35, 15-20Hz rate limiting), 22px deadzone,
                        hard-turn W0 pauses, off-screen marker sweep, and vertical jump unstuck.
-- Safety & Guards:
+- Performance & Safety:
+    - Downscaled heavy vision passes (0.5x frame: 640x360 for sealed ring & optical flow unstuck)
+    - Ground motion check throttled to every 3rd frame (frame_idx % 3 == 0, saving ~75% CPU)
+    - Debug window rendering throttled to max 20 FPS while capture & control run at full speed
     - Active Window Focus Lock (win32gui.GetForegroundWindow() == hwnd)
     - Global F12 Instant Pause / Resume Toggle (pynput)
     - 15-Second Safety Watchdog in Microcontroller Firmware + 4.0s keepalive
@@ -69,18 +73,25 @@ CHOICE_TEMPLATE_PATH = os.path.join(ASSETS_DIR, "choice_icon.png")
 
 TARGET_WIDTH = 1280
 TARGET_HEIGHT = 720
+HALF_WIDTH = 640
+HALF_HEIGHT = 360
 
 # Region of Interest (ROI) Definitions in 1280x720 Space: [y1, y2, x1, x2]
 ROI_MINIMAP = (0, 180, 0, 250)         # Top-Left Minimap
 ROI_NAV = (100, 540, 190, 1090)        # Central Gold Quest Marker Tracking Area
 ROI_CHOICE = (320, 560, 700, 1090)     # Middle-Right Dialogue Option Area
-ROI_GROUND = (500, 680, 440, 840)      # Lower-Center Ground Motion Differencing
 ROI_COMBAT = (36, 360, 100, 1180)      # Upper/Middle Enemy Health Bar Area
 ROI_INTERACT = (300, 490, 740, 940)    # Overworld [F] Prompt Area
 ROI_PARTY = (170, 470, 1130, 1260)     # Right-Hand Party Portrait Stack
-ROI_CHEST = (180, 620, 200, 1080)      # Overworld Chest Scan Area
 
-# Minimap Geometry
+# ROI for Sealed Chest Ring in 1280x720: tighter mid-screen area
+ROI_SEALED_CHEST = (220, 560, 300, 980)
+
+# Corresponding ROIs in 0.5x Space (640x360)
+ROI_SEALED_CHEST_HALF = (110, 280, 150, 490)  # y1, y2, x1, x2 in 640x360
+ROI_GROUND_HALF = (250, 340, 220, 420)        # Lower-center ground in 640x360
+
+# Minimap Geometry (Full Res)
 MINIMAP_CENTER = (114, 96)
 MINIMAP_RADIUS = 68
 
@@ -530,7 +541,6 @@ class VisionDetector:
         Detect active unlocked party size (1 to 4) by inspecting the right-hand
         portrait stack (ROI_PARTY: x: 1130..1260, y: 170..470).
         """
-        # Vertical boundaries for slots 1, 2, 3, 4
         slot_y_ranges = [
             (180, 245),  # Slot 1 (Lumine / Starter)
             (255, 320),  # Slot 2 (Amber)
@@ -546,29 +556,24 @@ class VisionDetector:
             if slot_roi.size == 0:
                 break
 
-            # Character portrait slots feature a distinct health bar and avatar frame
-            # Check for the white number badge / colored HP line in lower portion of the slot
             hp_band = slot_roi[44:60, 20:85]
             if hp_band.size == 0:
                 break
 
             hsv_hp = cv2.cvtColor(hp_band, cv2.COLOR_BGR2HSV)
-            # Green or red HP bar pixels
             green_mask = cv2.inRange(hsv_hp, np.array([35, 100, 100]), np.array([85, 255, 255]))
             red_mask1 = cv2.inRange(hsv_hp, np.array([0, 100, 100]), np.array([12, 255, 255]))
             red_mask2 = cv2.inRange(hsv_hp, np.array([170, 100, 100]), np.array([179, 255, 255]))
             hp_mask = cv2.bitwise_or(green_mask, cv2.bitwise_or(red_mask1, red_mask2))
 
-            # Also check circular portrait edge density
             gray_slot = cv2.cvtColor(slot_roi[6:45, 15:85], cv2.COLOR_BGR2GRAY)
             edges = cv2.Canny(gray_slot, 60, 150)
             edge_density = float(np.count_nonzero(edges)) / float(gray_slot.size)
 
-            # Slot is occupied if HP bar pixels exist or portrait frame has strong edges
             if cv2.countNonZero(hp_mask) >= 18 or edge_density > 0.08:
                 active_count = slot_idx + 1
             else:
-                break  # Party slots are always populated sequentially
+                break
 
         return max(1, min(4, active_count))
 
@@ -577,12 +582,7 @@ class VisionDetector:
     ) -> Tuple[bool, int, float, Optional[Tuple[int, int]], bool]:
         """
         Combat trigger: Detect enemy red HP bars in upper/middle screen (y: 36..360).
-        Returns:
-            - in_combat: bool
-            - pixel_count: int
-            - largest_contour_area: float
-            - target_centroid: Optional (cx, cy)
-            - is_elevated: bool (True if enemy is high on screen, e.g. Hilichurl archer on tower)
+        Returns: (in_combat, pixel_count, largest_contour_area, target_centroid, is_elevated)
         """
         y1, y2, x1, x2 = ROI_COMBAT
         roi = frame_bgr[y1:y2, x1:x2]
@@ -611,49 +611,65 @@ class VisionDetector:
                         cx = int(M["m10"] / M["m00"]) + x1
                         cy = int(M["m01"] / M["m00"]) + y1
                         target_centroid = (cx, cy)
-                        # Elevated check: Hilichurl archers on towers appear high up (y < 290)
                         if cy < 290:
                             is_elevated = True
 
         in_combat = pixel_count >= 130
         return in_combat, pixel_count, largest_area, target_centroid, is_elevated
 
-    def detect_chest(
-        self, frame_bgr: np.ndarray
+    def detect_sealed_chest_ring(
+        self, frame_half: np.ndarray
     ) -> Tuple[bool, Optional[Tuple[int, int, int, int]], Optional[Tuple[int, int]]]:
         """
-        Detect Common / Exquisite / Precious chests in overworld (ROI_CHEST: x: 200..1080, y: 180..620).
-        Identifies:
-        1. Glowing red/orange/teal sealed-chest lock rings
-        2. Warm wooden-gold chest body contours (area: 400..6500 px)
+        Detect glowing red/crimson or anemo-teal sealed-chest lock rings in tighter mid-screen ROI.
+        Evaluated on 0.5x downscaled frame (ROI_SEALED_CHEST_HALF: y: 110..280, x: 150..490).
+        Filters contours for circularity / aspect ratio (0.70..1.35) and area (350..3200 px in full-res).
+        Eliminates all broad terrain, brown dirt, and rock false-positives!
+        Returns: (detected, bbox_1280x720, centroid_1280x720)
         """
-        y1, y2, x1, x2 = ROI_CHEST
-        roi = frame_bgr[y1:y2, x1:x2]
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        y1, y2, x1, x2 = ROI_SEALED_CHEST_HALF
+        roi_half = frame_half[y1:y2, x1:x2]
+        if roi_half.size == 0:
+            return False, None, None
 
-        # 1. Sealed chest glowing ring (red/orange runes)
-        ring_mask1 = cv2.inRange(hsv, np.array([0, 160, 180]), np.array([14, 255, 255]))
-        ring_mask2 = cv2.inRange(hsv, np.array([170, 160, 180]), np.array([179, 255, 255]))
-        ring_mask_teal = cv2.inRange(hsv, np.array([80, 150, 180]), np.array([105, 255, 255]))
-        ring_mask = cv2.bitwise_or(ring_mask1, cv2.bitwise_or(ring_mask2, ring_mask_teal))
+        hsv_half = cv2.cvtColor(roi_half, cv2.COLOR_BGR2HSV)
 
-        # 2. Chest wooden-gold body
-        body_mask = cv2.inRange(hsv, np.array([10, 75, 65]), np.array([26, 230, 215]))
-        combined_chest = cv2.bitwise_or(ring_mask, body_mask)
+        # 1. High-saturation glowing Red/Crimson ring:
+        # H: 0..8 or 172..180, S: 175..255, V: 170..255
+        red_ring1 = cv2.inRange(hsv_half, np.array([0, 175, 170]), np.array([8, 255, 255]))
+        red_ring2 = cv2.inRange(hsv_half, np.array([172, 175, 170]), np.array([180, 255, 255]))
+        red_ring = cv2.bitwise_or(red_ring1, red_ring2)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        cleaned = cv2.morphologyEx(combined_chest, cv2.MORPH_CLOSE, kernel)
+        # 2. Glowing Anemo-Teal ring:
+        # H: 82..98, S: 160..255, V: 170..255
+        teal_ring = cv2.inRange(hsv_half, np.array([82, 160, 170]), np.array([98, 255, 255]))
 
+        ring_mask = cv2.bitwise_or(red_ring, teal_ring)
+
+        # Clean noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        cleaned = cv2.morphologyEx(ring_mask, cv2.MORPH_OPEN, kernel)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+
+        # Area scaled to 0.5x is 1/4 of 1280x720 area:
+        # 350 px full-res -> ~87 px half-res
+        # 3200 px full-res -> ~800 px half-res
         contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in contours:
-            area = cv2.contourArea(c)
-            if 400 <= area <= 6500:
+            area_half = cv2.contourArea(c)
+            if 87 <= area_half <= 800:
                 bx, by, bw, bh = cv2.boundingRect(c)
-                aspect_ratio = float(bw) / float(bh) if bh > 0 else 0
-                if 0.80 <= aspect_ratio <= 2.30:
-                    cx = x1 + bx + bw // 2
-                    cy = y1 + by + bh // 2
-                    return True, (x1 + bx, y1 + by, bw, bh), (cx, cy)
+                if bh > 0:
+                    aspect_ratio = float(bw) / float(bh)
+                    if 0.70 <= aspect_ratio <= 1.35:
+                        # Centroid in half-res
+                        cx_half = x1 + bx + bw // 2
+                        cy_half = y1 + by + bh // 2
+                        # Scale back to 1280x720 coordinates
+                        cx_full = cx_half * 2
+                        cy_full = cy_full = cy_half * 2
+                        bbox_full = ((x1 + bx) * 2, (y1 + by) * 2, bw * 2, bh * 2)
+                        return True, bbox_full, (cx_full, cy_full)
 
         return False, None, None
 
@@ -662,22 +678,18 @@ class VisionDetector:
     ) -> Tuple[Optional[float], Optional[float], bool]:
         """
         Extract quest bearing and segment Mondstadt dirt/stone paths inside circular minimap.
-        Returns:
-            - quest_bearing: Optional[float] (angle in radians relative to straight ahead)
-            - road_bearing: Optional[float] (angle in radians of path within +/- 55 deg of quest)
-            - has_road: bool
+        Returns: (quest_bearing, road_bearing, has_road)
         """
         cx, cy = MINIMAP_CENTER
         r = MINIMAP_RADIUS
 
-        # Crop square around minimap circle
         mini_roi = frame_bgr[cy - r : cy + r, cx - r : cx + r]
         if mini_roi.size == 0:
             return None, None, False
 
         hsv_mini = cv2.cvtColor(mini_roi, cv2.COLOR_BGR2HSV)
 
-        # 1. Quest Marker detection inside minimap (gold diamond / arrow)
+        # 1. Quest Marker detection inside minimap
         gold_mask = cv2.inRange(hsv_mini, np.array([18, 130, 175]), np.array([36, 255, 255]))
         q_contours, _ = cv2.findContours(gold_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         quest_bearing = None
@@ -687,22 +699,18 @@ class VisionDetector:
                 if M["m00"] > 0:
                     q_local_x = M["m10"] / M["m00"]
                     q_local_y = M["m01"] / M["m00"]
-                    # Angle relative to straight ahead (Up = -Y):
-                    # atan2(dx, -dy) gives 0 rad = straight ahead, + = right, - = left
                     dx = q_local_x - r
                     dy = q_local_y - r
                     quest_bearing = math.atan2(dx, -dy)
                     break
 
-        # 2. Road Segmentation inside minimap (dirt / stone path: H: 12..32, S: 15..95, V: 155..245)
+        # 2. Road Segmentation inside minimap
         road_mask = cv2.inRange(hsv_mini, np.array([12, 15, 155]), np.array([32, 95, 245]))
 
-        # Apply circular mask inside local crop
         local_circle = np.zeros((2 * r, 2 * r), dtype=np.uint8)
         cv2.circle(local_circle, (r, r), r - 4, 255, -1)
         road_in_minimap = cv2.bitwise_and(road_mask, local_circle)
 
-        # Find road pixels in the forward cone (+/- 55 degrees of quest bearing or straight ahead)
         ref_angle = quest_bearing if quest_bearing is not None else 0.0
         cone_limit = math.radians(55)
 
@@ -714,7 +722,7 @@ class VisionDetector:
             p_dx = px - r
             p_dy = py - r
             dist = math.hypot(p_dx, p_dy)
-            if dist > 14:  # ignore player arrow at exact center
+            if dist > 14:
                 p_angle = math.atan2(p_dx, -p_dy)
                 diff_angle = abs(math.atan2(math.sin(p_angle - ref_angle), math.cos(p_angle - ref_angle)))
                 if diff_angle <= cone_limit:
@@ -765,18 +773,22 @@ class VisionDetector:
 
         return best_centroid, clean_mask
 
-    def calculate_ground_motion(
-        self, frame_bgr: np.ndarray, prev_ground_gray: Optional[np.ndarray]
+    def calculate_ground_motion_downscaled(
+        self, frame_half: np.ndarray, prev_ground_gray_half: Optional[np.ndarray]
     ) -> Tuple[float, np.ndarray]:
-        """Frame-differencing motion score on the lower-center ground region."""
-        y1, y2, x1, x2 = ROI_GROUND
-        roi = frame_bgr[y1:y2, x1:x2]
+        """
+        Frame-differencing motion score on the lower-center ground region on 0.5x frame.
+        ROI_GROUND_HALF: y: 250..340, x: 220..420 in 640x360 space.
+        Cuts CPU consumption by ~75% compared to full-resolution differencing!
+        """
+        y1, y2, x1, x2 = ROI_GROUND_HALF
+        roi = frame_half[y1:y2, x1:x2]
         curr_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        if prev_ground_gray is None:
+        if prev_ground_gray_half is None:
             return 10.0, curr_gray
 
-        diff = cv2.absdiff(curr_gray, prev_ground_gray)
+        diff = cv2.absdiff(curr_gray, prev_ground_gray_half)
         motion_score = float(np.mean(diff))
         return motion_score, curr_gray
 
@@ -819,22 +831,33 @@ class GenshinAssistant:
         self.unstuck_still_start_time: float = 0.0
         self.last_lateral_unstuck_time: float = 0.0
 
-        # Overworld [F] Prompt & Chest Loot
+        # Downscaled Ground Motion Differencing
+        self.prev_ground_gray_half: Optional[np.ndarray] = None
+        self.smooth_motion_score = 10.0
+        self.is_stuck_alert = False
+        self.frame_idx: int = 0
+
+        # Multi-Second Loot Vacuum & Overworld [F] Prompt
         self.f_prompt_consecutive_frames: int = 0
         self.f_prompt_box: Optional[Tuple[int, int, int, int]] = None
         self.last_overworld_f_time: float = 0.0
-        self.overworld_f_cooldown: float = 1.6
-        self.pending_overworld_f_press_time: Optional[float] = None
+        self.overworld_f_cooldown: float = 1.4
         self.show_overworld_f_box_until: float = 0.0
         self.active_chest_box: Optional[Tuple[int, int, int, int]] = None
 
+        # Loot Vacuum State Machine
+        self.vacuum_active: bool = False
+        self.vacuum_phase: str = "IDLE"  # "WAIT_ANIMATION", "BURST", "DRAIN_PROMPT", "IDLE"
+        self.vacuum_animation_end_time: float = 0.0
+        self.vacuum_burst_start_time: float = 0.0
+        self.vacuum_burst_end_time: float = 0.0
+        self.next_vacuum_f_time: float = 0.0
+        self.vacuum_taps_count: int = 0
+        self.vacuum_wiggle_stage: int = 0
+        self.vacuum_drain_timeout: float = 0.0
+
         # Dialogue Skipping
         self.next_dialogue_f_time: float = 0.0
-
-        # Ground Motion Stuck Detection
-        self.prev_ground_gray: Optional[np.ndarray] = None
-        self.smooth_motion_score = 10.0
-        self.is_stuck_alert = False
 
         # Deliberate, Paced Auto-Combat System
         self.combat_start_time = 0.0
@@ -856,6 +879,9 @@ class GenshinAssistant:
         self.is_aiming_bow: bool = False
         self.bow_aim_shot_count: int = 0
 
+        # Performance Throttling (20 FPS Debug Rendering)
+        self.last_render_time: float = 0.0
+
         # Global Hotkey Pause State
         self.global_paused = False
         self.setup_global_hotkeys()
@@ -873,7 +899,8 @@ class GenshinAssistant:
                 if self.global_paused:
                     self.hid.stop_all()
                     self.f_prompt_consecutive_frames = 0
-                    self.pending_overworld_f_press_time = None
+                    self.vacuum_active = False
+                    self.vacuum_phase = "IDLE"
                     self.is_scanning_for_marker = False
                     if self.is_aiming_bow:
                         self.hid.press_r()
@@ -883,6 +910,30 @@ class GenshinAssistant:
         listener.daemon = True
         listener.start()
         print("[HOTKEY] Registered global 'F12' instant toggle pause listener.")
+
+    def start_loot_vacuum(self, now: float):
+        """
+        Initiates multi-second loot vacuum sequence:
+        1. Halt movement (W0) immediately.
+        2. Interact / open chest with primary [F].
+        3. Wait 0.65s for chest lid animation & scattered loot to land.
+        4. 2.2s-2.8s vacuum burst: tap [F] every 0.16s-0.24s with left/right camera wiggle.
+        5. Drain stacked prompt: keep tapping [F] (0.18s-0.26s) until [F] box disappears.
+        """
+        self.hid.stop_walk()
+        self.hid.press_f()  # Trigger primary interact/open
+        self.vacuum_active = True
+        self.vacuum_phase = "WAIT_ANIMATION"
+        self.vacuum_animation_end_time = now + 0.65
+        burst_duration = random.uniform(2.2, 2.8)
+        self.vacuum_burst_start_time = self.vacuum_animation_end_time
+        self.vacuum_burst_end_time = self.vacuum_animation_end_time + burst_duration
+        self.next_vacuum_f_time = self.vacuum_animation_end_time
+        self.vacuum_taps_count = 1
+        self.vacuum_wiggle_stage = 0
+        self.vacuum_drain_timeout = self.vacuum_burst_end_time + 4.0
+        self.current_state = STATE_CHEST_LOOT
+        print(f"[LOOT VACUUM] Chest/loot triggered: waiting 0.65s lid animation then {burst_duration:.2f}s vacuum burst.")
 
     def run(self):
         setup_dpi_awareness()
@@ -895,8 +946,9 @@ class GenshinAssistant:
         current_fps = 0.0
 
         print("\n" + "=" * 70)
-        print(" Genshin Impact CV Assistant Running (v3 Strict State Overhaul)")
+        print(" Genshin Impact CV Assistant Running (v3.1 Optimized)")
         print(" Hierarchy: DIALOGUE > COMBAT_AUTO > CHEST_LOOT > NAVIGATE")
+        print(" Performance: Downscaled 0.5x vision, 20 FPS GUI rendering throttle")
         print(" Hotkeys:")
         print("   [F12] : Instant Global Pause / Resume Toggle")
         print("   [S]   : Save current Tuner settings to config.json")
@@ -907,16 +959,14 @@ class GenshinAssistant:
         with mss_factory() as sct:
             try:
                 while True:
-                    loop_start = time.time()
+                    self.frame_idx += 1
+                    now = time.time()
 
-                    # 1. Update Tuner sliders
-                    self.config = {**self.config, **read_tuner_values()}
-
-                    # 2. Window Discovery & Focus Check
+                    # 1. Window Discovery & Focus Check
                     hwnd, client_rect = find_genshin_window()
                     is_focused = is_genshin_focused(hwnd) if hwnd != 0 else False
 
-                    # 3. Capture Screen Frame
+                    # 2. Capture Screen Frame
                     frame = None
                     if client_rect is not None and client_rect["width"] > 0 and client_rect["height"] > 0:
                         grab_rect = {
@@ -941,62 +991,77 @@ class GenshinAssistant:
                         frame = cv2.resize(frame_raw, (TARGET_WIDTH, TARGET_HEIGHT))
 
                     if frame is None:
-                        time.sleep(0.04)
+                        time.sleep(0.02)
                         continue
 
-                    debug_frame = frame.copy()
+                    # Downscale frame once (0.5x: 640x360) for heavy vision passes
+                    frame_half = cv2.resize(frame, (HALF_WIDTH, HALF_HEIGHT))
 
-                    # 4. SAFETY GUARD: Active-Window Focus Check & F12 Pause
+                    # 3. SAFETY GUARD: Active-Window Focus Check & F12 Pause
                     if not is_focused:
                         self.hid.stop_all()
+                        self.vacuum_active = False
+                        self.vacuum_phase = "IDLE"
                         if self.is_aiming_bow:
                             self.hid.press_r()
                             self.is_aiming_bow = False
-                        self._draw_overlay_notice(debug_frame, "PAUSED (Window Unfocused)", (0, 0, 255))
                     elif self.global_paused:
                         self.hid.stop_all()
+                        self.vacuum_active = False
+                        self.vacuum_phase = "IDLE"
                         if self.is_aiming_bow:
                             self.hid.press_r()
                             self.is_aiming_bow = False
-                        self._draw_overlay_notice(debug_frame, "PAUSED (User F12 Toggle)", (0, 165, 255))
                     else:
-                        # 5. Execute Strict State Hierarchy
-                        self._execute_state_machine(frame, debug_frame)
+                        # 4. Execute Strict State Hierarchy (Full control loop speed!)
+                        self._execute_state_machine(frame, frame_half)
 
-                    # 6. Calculate FPS
+                    # 5. Calculate Internal Loop Processing FPS
                     fps_counter += 1
-                    if time.time() - fps_start_time >= 1.0:
-                        current_fps = fps_counter / (time.time() - fps_start_time)
+                    if now - fps_start_time >= 1.0:
+                        current_fps = fps_counter / (now - fps_start_time)
                         fps_counter = 0
-                        fps_start_time = time.time()
+                        fps_start_time = now
 
-                    # 7. Render HUD & Visual Overlays
-                    self._draw_hud(debug_frame, current_fps, is_focused)
+                    # 6. Throttle Debug Window Rendering to max 20 FPS (~50ms)
+                    if now - self.last_render_time >= 0.05:
+                        self.last_render_time = now
 
-                    cv2.imshow("Genshin Assistant Debug", debug_frame)
+                        # Update Tuner values from GUI sliders
+                        self.config = {**self.config, **read_tuner_values()}
 
-                    # Display Tuner Mask thumbnail in Tuner window
-                    _, gold_mask = self.detector.track_gold_quest_marker(frame, self.config)
-                    mask_display = cv2.cvtColor(cv2.resize(gold_mask, (480, 270)), cv2.COLOR_GRAY2BGR)
-                    cv2.putText(
-                        mask_display,
-                        "Quest Gold Mask Preview",
-                        (15, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 255, 255),
-                        2,
-                    )
-                    cv2.imshow(TUNER_WINDOW, mask_display)
+                        debug_frame = frame.copy()
+                        if not is_focused:
+                            self._draw_overlay_notice(debug_frame, "PAUSED (Window Unfocused)", (0, 0, 255))
+                        elif self.global_paused:
+                            self._draw_overlay_notice(debug_frame, "PAUSED (User F12 Toggle)", (0, 165, 255))
+                        else:
+                            self._draw_hud(debug_frame, current_fps, is_focused)
 
-                    # 8. User Interaction
-                    key = cv2.waitKey(1) & 0xFF
-                    if key in (ord("q"), ord("Q"), 27):
-                        print("\n[INFO] Clean exit requested by user.")
-                        break
-                    elif key in (ord("s"), ord("S")):
-                        if save_config(self.config):
-                            self.save_banner_until = time.time() + 2.0
+                        cv2.imshow("Genshin Assistant Debug", debug_frame)
+
+                        # Display Tuner Mask thumbnail in Tuner window
+                        _, gold_mask = self.detector.track_gold_quest_marker(frame, self.config)
+                        mask_display = cv2.cvtColor(cv2.resize(gold_mask, (480, 270)), cv2.COLOR_GRAY2BGR)
+                        cv2.putText(
+                            mask_display,
+                            "Quest Gold Mask Preview",
+                            (15, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (0, 255, 255),
+                            2,
+                        )
+                        cv2.imshow(TUNER_WINDOW, mask_display)
+
+                        # Handle Hotkeys
+                        key = cv2.waitKey(1) & 0xFF
+                        if key in (ord("q"), ord("Q"), 27):
+                            print("\n[INFO] Clean exit requested by user.")
+                            break
+                        elif key in (ord("s"), ord("S")):
+                            if save_config(self.config):
+                                self.save_banner_until = time.time() + 2.0
 
             finally:
                 self.cleanup()
@@ -1004,7 +1069,7 @@ class GenshinAssistant:
     # ==========================================================================
     # Strict State Machine Hierarchy
     # ==========================================================================
-    def _execute_state_machine(self, frame: np.ndarray, debug_frame: np.ndarray):
+    def _execute_state_machine(self, frame: np.ndarray, frame_half: np.ndarray):
         now = time.time()
 
         # Update detected party size dynamically (1 to 4 slots)
@@ -1025,18 +1090,12 @@ class GenshinAssistant:
                 self.hid.release_lmb()
                 self.is_scanning_for_marker = False
                 self.f_prompt_consecutive_frames = 0
-                self.pending_overworld_f_press_time = None
+                self.vacuum_active = False
+                self.vacuum_phase = "IDLE"
                 self.next_dialogue_f_time = now + dialogue_advance_delay()
                 if self.is_aiming_bow:
                     self.hid.press_r()
                     self.is_aiming_bow = False
-
-            # Active Dialogue Progression (advance lines & choices at natural log-normal cadence)
-            choice_detected, choice_box = self.detector.check_choice_icon(frame)
-            if choice_detected and choice_box:
-                bx, by, bw, bh = choice_box
-                cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
-                cv2.putText(debug_frame, "CHOICE ICON", (bx, by - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
 
             if now >= self.next_dialogue_f_time:
                 self.hid.press_f()
@@ -1062,6 +1121,8 @@ class GenshinAssistant:
                 self.melee_damage_stall_timer = now
                 self.last_enemy_hp_pixels = red_pixels
                 self.is_scanning_for_marker = False
+                self.vacuum_active = False
+                self.vacuum_phase = "IDLE"
                 self.hid.stop_walk()   # Send W0 immediately
                 self.hid.stop_all()
                 print(f"[STATE] Entered {STATE_COMBAT_AUTO} (Enemies: {red_pixels}px, elevated: {is_elevated})")
@@ -1099,23 +1160,105 @@ class GenshinAssistant:
             return
 
         # ----------------------------------------------------------------------
-        # HIERARCHY LEVEL 3: CHEST_LOOT
+        # HIERARCHY LEVEL 3: CHEST_LOOT (Active Vacuum OR High-Confidence Ring)
         # ----------------------------------------------------------------------
-        chest_detected, chest_box, chest_centroid = self.detector.detect_chest(frame)
-        if chest_detected and chest_centroid:
+        if self.vacuum_active:
             self.current_state = STATE_CHEST_LOOT
-            self._execute_chest_loot_step(now, chest_box, chest_centroid, frame, debug_frame)
+            self._execute_loot_vacuum_step(now, frame)
+            self.previous_minimap_state = True
+            return
+
+        # Check high-confidence sealed chest lock ring on 0.5x frame
+        ring_detected, ring_box, ring_centroid = self.detector.detect_sealed_chest_ring(frame_half)
+        if ring_detected and ring_centroid:
+            self.current_state = STATE_CHEST_LOOT
+            self.active_chest_box = ring_box
+            cx, cy = ring_centroid
+            error_x = cx - 640
+
+            # Check if reached or [F] prompt appears
+            f_detected, _ = self.detector.detect_overworld_f_prompt(frame)
+            if f_detected or cy >= 440:
+                self.start_loot_vacuum(now)
+            else:
+                self._apply_humanized_steering(error_x, now)
+                self.hid.start_walk()
+
             self.previous_minimap_state = True
             return
         elif self.current_state == STATE_CHEST_LOOT:
             self.current_state = STATE_NAVIGATE
+            self.active_chest_box = None
 
         # ----------------------------------------------------------------------
         # HIERARCHY LEVEL 4: NAVIGATE (with Road-Following & EMA Smoothing)
         # ----------------------------------------------------------------------
         self.current_state = STATE_NAVIGATE
-        self._execute_navigate_step(now, frame, debug_frame)
+        self._execute_navigate_step(now, frame, frame_half)
         self.previous_minimap_state = True
+
+    # ==========================================================================
+    # Multi-Second Loot Vacuum Step
+    # ==========================================================================
+    def _execute_loot_vacuum_step(self, now: float, frame: np.ndarray):
+        """
+        Drives the multi-second loot vacuum:
+        1. WAIT_ANIMATION : waits 0.65s for chest lid opening & items dropping.
+        2. BURST          : 2.2-2.8s vacuum burst tapping [F] every 0.16-0.24s with camera wiggle.
+        3. DRAIN_PROMPT   : taps [F] every 0.18-0.26s until [F] box completely disappears.
+        """
+        self.hid.stop_walk()  # Always remain stationary while vacuuming loot
+
+        if self.vacuum_phase == "WAIT_ANIMATION":
+            if now >= self.vacuum_animation_end_time:
+                self.vacuum_phase = "BURST"
+                self.next_vacuum_f_time = now
+            return
+
+        if self.vacuum_phase == "BURST":
+            # Tap [F] at rapid cadence (0.16s - 0.24s)
+            if now >= self.next_vacuum_f_time:
+                self.hid.press_f()
+                self.vacuum_taps_count += 1
+                self.next_vacuum_f_time = now + random.uniform(0.16, 0.24)
+
+            # Gentle camera wiggle across the burst:
+            # 25% -> M-18,0 | 50% -> M36,0 | 75% -> M-18,0
+            burst_duration = max(0.1, self.vacuum_burst_end_time - self.vacuum_burst_start_time)
+            progress = (now - self.vacuum_burst_start_time) / burst_duration
+
+            if progress >= 0.22 and self.vacuum_wiggle_stage == 0:
+                self.hid.move_mouse(-18, 0)
+                self.vacuum_wiggle_stage = 1
+            elif progress >= 0.50 and self.vacuum_wiggle_stage == 1:
+                self.hid.move_mouse(36, 0)
+                self.vacuum_wiggle_stage = 2
+            elif progress >= 0.78 and self.vacuum_wiggle_stage == 2:
+                self.hid.move_mouse(-18, 0)
+                self.vacuum_wiggle_stage = 3
+
+            if now >= self.vacuum_burst_end_time:
+                self.vacuum_phase = "DRAIN_PROMPT"
+                self.next_vacuum_f_time = now
+            return
+
+        if self.vacuum_phase == "DRAIN_PROMPT":
+            # Check if [F] prompt remains visible for stacked item drops
+            f_detected, _ = self.detector.detect_overworld_f_prompt(frame)
+            if f_detected and (now < self.vacuum_drain_timeout):
+                if now >= self.next_vacuum_f_time:
+                    self.hid.press_f()
+                    self.vacuum_taps_count += 1
+                    self.next_vacuum_f_time = now + random.uniform(0.18, 0.26)
+            else:
+                print(f"[LOOT VACUUM] Vacuum completed ({self.vacuum_taps_count} total taps). Resuming overworld.")
+                self.vacuum_active = False
+                self.vacuum_phase = "IDLE"
+                self.active_chest_box = None
+                self.last_overworld_f_time = now
+                self.overworld_f_cooldown = random.uniform(1.4, 2.0)
+                self.f_prompt_consecutive_frames = 0
+                self.current_state = STATE_NAVIGATE
 
     # ==========================================================================
     # Slower, Paced Starter Combat & Amber Bow Aiming
@@ -1128,12 +1271,11 @@ class GenshinAssistant:
         - 7.0-10.0s character swaps (only slots 1..detected_party_size)
         - Amber Aim-Shot mode for elevated (y<290) or stalled (>4s) enemies
         """
-        # Check damage stall
         if red_pixels < self.last_enemy_hp_pixels:
             self.melee_damage_stall_timer = now
             self.last_enemy_hp_pixels = red_pixels
         elif now - self.melee_damage_stall_timer > 4.0:
-            is_elevated = True  # Fall back to ranged bow shots if melee is obstructed
+            is_elevated = True
 
         # --- Amber Bow Aiming Mode for Elevated / Ranged Enemies ---
         amber_slot = 2 if self.detected_party_size >= 2 else 1
@@ -1150,21 +1292,18 @@ class GenshinAssistant:
                 self.active_combat_action_label = "Amber: Entering Aim Mode [R]"
                 return
 
-            # While in Bow Aim Mode: steer 2-axis reticle toward target torso
             if self.combat_target_centroid is not None:
                 ecx, ecy = self.combat_target_centroid
                 target_x = ecx
-                target_y = ecy + 35  # aim slightly below red HP bar onto torso/head
+                target_y = ecy + 35
 
                 aim_err_x = target_x - 640
                 aim_err_y = target_y - 360
 
-                # 2-Axis mouse steering
                 dx = max(-40, min(40, int(aim_err_x * 0.18)))
                 dy = max(-40, min(40, int(aim_err_y * 0.18)))
                 self.hid.move_mouse(dx, dy)
 
-                # Fire charged Pyro shot when aligned within 24 px
                 if abs(aim_err_x) < 24 and abs(aim_err_y) < 24:
                     self.active_combat_action_label = f"Amber: Charged Shot ({self.bow_aim_shot_count + 1}/3)"
                     self.hid.hold_lmb()
@@ -1180,17 +1319,15 @@ class GenshinAssistant:
                         self.active_combat_action_label = "Amber: Exiting Aim Mode [R]"
             return
 
-        # If leaving aim mode
         if self.is_aiming_bow:
             self.hid.press_r()
             self.is_aiming_bow = False
             time.sleep(0.3)
 
-        # Rate limiter for ground combat actions
         if now < self.combat_step_ready_time:
             return
 
-        # 1. Deliberate Party Swap (every 7.0 - 10.0s, only within detected party size)
+        # 1. Deliberate Party Swap (every 7.0 - 10.0s)
         if self.detected_party_size > 1 and (now - self.last_party_swap_time >= self.next_party_swap_interval):
             next_slot = (self.current_party_slot % self.detected_party_size) + 1
             self.hid.select_slot(next_slot)
@@ -1236,49 +1373,9 @@ class GenshinAssistant:
                 self.combat_step_ready_time = now + random.uniform(0.45, 0.75)
 
     # ==========================================================================
-    # Automatic Chest Detection & Looting
-    # ==========================================================================
-    def _execute_chest_loot_step(
-        self,
-        now: float,
-        chest_box: Tuple[int, int, int, int],
-        chest_centroid: Tuple[int, int],
-        frame: np.ndarray,
-        debug_frame: np.ndarray,
-    ):
-        """Walk up to spotted chests, stop on [F] prompt, open, and collect loot drops."""
-        self.active_chest_box = chest_box
-        cx, cy = chest_centroid
-        error_x = cx - 640
-
-        # Draw chest box on debug frame
-        bx, by, bw, bh = chest_box
-        cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (0, 165, 255), 2)
-        cv2.putText(debug_frame, "CHEST SPOTTED", (bx, by - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 165, 255), 2)
-
-        # Check for interaction [F] prompt
-        f_prompt_detected, prompt_box = self.detector.detect_overworld_f_prompt(frame)
-        if f_prompt_detected or cy >= 440:
-            # Reached chest: stop walking and open!
-            self.hid.stop_walk()
-            print("[CHEST] Reached chest: opening & looting drops.")
-            self.hid.press_f()
-            time.sleep(0.30)
-            # Tap [F] 2-3 times to collect dropped items
-            for _ in range(random.randint(2, 3)):
-                self.hid.press_f()
-                time.sleep(0.25)
-            self.active_chest_box = None
-            self.current_state = STATE_NAVIGATE
-        else:
-            # Steer toward chest and walk forward
-            self._apply_humanized_steering(error_x, now)
-            self.hid.start_walk()
-
-    # ==========================================================================
     # Overworld Navigation (with Minimap Road-Following & EMA Smoothing)
     # ==========================================================================
-    def _execute_navigate_step(self, now: float, frame: np.ndarray, debug_frame: np.ndarray):
+    def _execute_navigate_step(self, now: float, frame: np.ndarray, frame_half: np.ndarray):
         # 1. Transition V pulse from Dialogue
         if not self.previous_minimap_state:
             self.pending_v_pulse_time = now + random.uniform(0.3, 0.6)
@@ -1287,30 +1384,24 @@ class GenshinAssistant:
             self.hid.press_v()
             self.pending_v_pulse_time = None
 
-        # 2. Overworld [F] Prompt Detection (Statues, Waypoints, Items, NPCs)
+        # 2. Overworld [F] Prompt Detection (Triggers Loot Vacuum!)
         f_prompt_detected, prompt_box = self.detector.detect_overworld_f_prompt(frame)
         if f_prompt_detected and prompt_box:
             self.f_prompt_consecutive_frames += 1
             self.f_prompt_box = prompt_box
-            if self.f_prompt_consecutive_frames >= 2:
+            if self.f_prompt_consecutive_frames >= 2 and (now - self.last_overworld_f_time >= self.overworld_f_cooldown):
                 self.show_overworld_f_box_until = now + 1.2
-                if (now - self.last_overworld_f_time >= self.overworld_f_cooldown) and (self.pending_overworld_f_press_time is None):
-                    if self.hid.is_walking:
-                        self.hid.stop_walk()
-                    self.pending_overworld_f_press_time = now + random.uniform(0.15, 0.28)
+                self.start_loot_vacuum(now)
+                return
         else:
             self.f_prompt_consecutive_frames = 0
 
-        if self.pending_overworld_f_press_time is not None and now >= self.pending_overworld_f_press_time:
-            print("[OVERWORLD] [F] Prompt confirmed: interacting.")
-            self.hid.press_f()
-            self.last_overworld_f_time = now
-            self.overworld_f_cooldown = random.uniform(1.4, 2.1)
-            self.pending_overworld_f_press_time = None
-
-        # 3. Ground Motion Differencing (Stuck / Cliff Detection)
-        raw_motion, self.prev_ground_gray = self.detector.calculate_ground_motion(frame, self.prev_ground_gray)
-        self.smooth_motion_score = 0.75 * self.smooth_motion_score + 0.25 * raw_motion
+        # 3. Downscaled Ground Motion Differencing (Run only every 3rd frame to save CPU)
+        if self.frame_idx % 3 == 0:
+            raw_motion, self.prev_ground_gray_half = self.detector.calculate_ground_motion_downscaled(
+                frame_half, self.prev_ground_gray_half
+            )
+            self.smooth_motion_score = 0.75 * self.smooth_motion_score + 0.25 * raw_motion
 
         # Vertical Jump / Obstacle Unstuck check: if motion < 1.05 for > 1.8s while walking
         if self.hid.is_walking and self.smooth_motion_score < 1.05:
@@ -1340,16 +1431,10 @@ class GenshinAssistant:
             self.is_scanning_for_marker = False
             cx, cy = centroid
 
-            # Draw centroid and crosshair
-            cv2.circle(debug_frame, (cx, cy), 8, (0, 215, 255), -1)
-            cv2.line(debug_frame, (cx - 15, cy), (cx + 15, cy), (0, 215, 255), 2)
-            cv2.line(debug_frame, (cx, cy - 15), (cx, cy + 15), (0, 215, 255), 2)
-
             raw_error_x = cx - 640
 
             # Bias error_x toward road if road exists within +/- 55 deg
             if has_road and road_bearing is not None:
-                # Convert road angle into equivalent screen horizontal offset
                 road_offset_x = road_bearing * (640.0 / (math.pi / 2.5))
                 effective_error_x = 0.45 * raw_error_x + 0.55 * road_offset_x
             else:
@@ -1380,7 +1465,7 @@ class GenshinAssistant:
                     self.hid.stop_all()
                     self.is_stuck_alert = True
                     play_alert_chime(880, 220)
-                elif not self.is_stuck_alert and (self.pending_overworld_f_press_time is None):
+                elif not self.is_stuck_alert and not self.vacuum_active:
                     self.hid.start_walk()
 
                     # Variable Sprint Cadence: Trigger RMB dash at randomized intervals (2.1 - 3.8s)
@@ -1417,11 +1502,9 @@ class GenshinAssistant:
         Applies smoothed, rate-limited (15-20 Hz) camera steering with a 22px deadzone.
         Clamps steering to [-45, 45] with Gaussian noise and human overshoot.
         """
-        # Horizontal center deadzone: within 22px, no steering adjustment
         if abs(error_x) < 22:
             return
 
-        # Rate-limit mouse steering packets to max 15-20 Hz (>= 0.055s spacing)
         if now - self.last_mouse_packet_time < 0.055:
             return
 
@@ -1436,7 +1519,7 @@ class GenshinAssistant:
         self.last_mouse_packet_time = now
 
     # ==========================================================================
-    # Visual HUD & Overlay Rendering
+    # Visual HUD & Overlay Rendering (Rendered at max 20 FPS)
     # ==========================================================================
     def _draw_hud(self, debug_frame: np.ndarray, fps: float, is_focused: bool):
         """Draw bounding boxes, telemetry stats, and hotkey banners on debug frame."""
@@ -1453,10 +1536,9 @@ class GenshinAssistant:
         # 3. Choice ROI (Green)
         cy1, cy2, cx1, cx2 = ROI_CHOICE
         cv2.rectangle(debug_frame, (cx1, cy1), (cx2, cy2), (0, 255, 0), 1)
-        cv2.putText(debug_frame, "Choice ROI", (cx1 + 5, cy1 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
 
-        # 4. Ground Motion ROI (Magenta)
-        gy1, gy2, gx1, gx2 = ROI_GROUND
+        # 4. Ground Motion ROI (Magenta in 1280x720)
+        gy1, gy2, gx1, gx2 = ROI_GROUND_HALF[0] * 2, ROI_GROUND_HALF[1] * 2, ROI_GROUND_HALF[2] * 2, ROI_GROUND_HALF[3] * 2
         cv2.rectangle(debug_frame, (gx1, gy1), (gx2, gy2), (255, 0, 255), 1)
         cv2.putText(debug_frame, f"Ground Motion: {self.smooth_motion_score:.2f}", (gx1 + 5, gy1 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
 
@@ -1468,7 +1550,6 @@ class GenshinAssistant:
         # 6. Interact Prompt ROI (Teal)
         iy1, iy2, ix1, ix2 = ROI_INTERACT
         cv2.rectangle(debug_frame, (ix1, iy1), (ix2, iy2), (180, 180, 0), 1)
-        cv2.putText(debug_frame, "Interact ROI", (ix1 + 5, iy1 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 0), 1)
 
         # 7. Party Portrait Stack ROI
         py1, py2, px1, px2 = ROI_PARTY
@@ -1481,11 +1562,11 @@ class GenshinAssistant:
             cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (255, 255, 0), 2)
             cv2.putText(debug_frame, "OVERWORLD [F]", (bx - 10, by - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
-        # Draw Chest Box if active
+        # Draw Sealed Chest Ring Box if spotted
         if self.active_chest_box:
             bx, by, bw, bh = self.active_chest_box
             cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (0, 165, 255), 2)
-            cv2.putText(debug_frame, "CHEST LOOT", (bx, by - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2)
+            cv2.putText(debug_frame, "SEALED CHEST RING", (bx, by - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2)
 
         # Draw enemy centroid if in combat
         if self.combat_target_centroid is not None and self.current_state in (STATE_COMBAT_AUTO, STATE_COMBAT_MANUAL):
@@ -1532,7 +1613,11 @@ class GenshinAssistant:
             telemetry_text = f"Combat: {elapsed:.1f}s/45s | Slot {self.current_party_slot}/{self.detected_party_size} | {self.active_combat_action_label}{aim_tag}"
             cv2.putText(debug_frame, telemetry_text, (270, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 220, 255), 1)
         elif self.current_state == STATE_CHEST_LOOT:
-            cv2.putText(debug_frame, "Approaching & Opening Chest...", (320, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 165, 255), 2)
+            if self.vacuum_active:
+                vac_text = f"VACUUM: {self.vacuum_phase} | Taps: {self.vacuum_taps_count}"
+            else:
+                vac_text = "Approaching Sealed Chest..."
+            cv2.putText(debug_frame, vac_text, (320, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 165, 255), 2)
         else:
             walk_label = "WALK [W1]" if self.hid.is_walking else "IDLE"
             walk_color = (0, 255, 0) if self.hid.is_walking else (160, 160, 160)
@@ -1605,7 +1690,7 @@ class GenshinAssistant:
 # CLI Entrypoint
 # ==============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Genshin Impact CV Automation with ESP32-S3 HID (v3 Overhaul)")
+    parser = argparse.ArgumentParser(description="Genshin Impact CV Automation with ESP32-S3 HID (v3.1 Optimized)")
     parser.add_argument("--port", type=str, default="COM4", help="Serial COM port of ESP32-S3 (default: COM4)")
     parser.add_argument(
         "--dry-run",
