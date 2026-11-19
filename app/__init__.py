@@ -16,7 +16,6 @@ from app.controller import ESP32HIDController, PDSteeringController
 from app.vision import VisionDetector
 from app.state_machine import AssistantStateMachine
 from app.flight_logger import FlightLogger
-from app.main import GenshinAssistantApp
 
 __all__ = [
     "load_config",
@@ -32,5 +31,4 @@ __all__ = [
     "VisionDetector",
     "AssistantStateMachine",
     "FlightLogger",
-    "GenshinAssistantApp",
 ]

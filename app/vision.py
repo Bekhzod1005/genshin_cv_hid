@@ -611,7 +611,7 @@ class VisionDetector:
         """
         Verify target hue in inner core (35% center has >= 28% matching hue pixels):
         - Gold: H: 16..40, S: 115..255, V: 165..255
-        - Blue: H: 92..124, S: 55..255, V: 135..255
+        - Blue: H: 82..126, S: 25..255, V: 135..255
         (Removed broken V_core - V_border >= 25 check which fails in daytime Mondstadt)
         """
         if patch_bgr.size == 0 or patch_bgr.shape[0] < 10 or patch_bgr.shape[1] < 10:

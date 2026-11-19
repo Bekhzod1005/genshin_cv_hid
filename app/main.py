@@ -8,10 +8,10 @@ Architecture:
   with non-blocking millis() scheduler, 512-byte RX buffer, micro-stepped mouse steering,
   and decoupled hold states.
 - Two-Zone PD Camera Steering & Pivot-in-Place:
-    - 28 Hz update rate, no pre-PD EMA lag
+    - 20 Hz update rate, no pre-PD EMA lag
     - Zone 1: Deadzone (|error_x| <= 24 px) -> dx = 0, hard center lock
-    - Zone 2: Fine Tracking (24 < |error_x| <= 130 px) -> Kp=0.26, Kd=0.09
-    - Zone 3: Fast Turn & Pivot (|error_x| > 130 px or minimap bearing > 38 deg) -> Kp=0.44, Kd=0.10
+    - Zone 2: Fine Tracking (24 < |error_x| <= 130 px) -> Kp=0.16, Kd=0.06
+    - Zone 3: Fast Turn & Pivot (|error_x| > 130 px or minimap bearing > 38 deg) -> Kp=0.26, Kd=0.06
     - Pivot-in-Place: W0 pauses walking whenever |error_x| > 115 px or turning towards minimap bearing
 - Strict State Hierarchy:
     1. DIALOGUE      : Minimap hidden -> Strict top priority, advances dialogue & multi-choice.

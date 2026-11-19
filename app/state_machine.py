@@ -274,7 +274,6 @@ class AssistantStateMachine:
                     if self.nav_mode != "ALIGN":
                         self.logger.log_event("NAV", "Mode reset -> ALIGN (entered dialogue)")
                 self.hid.stop_all()
-                self.hid.release_lmb()
                 self.combat_consecutive_frames = 0
                 self.sealed_chest_consecutive_frames = 0
                 self.f_prompt_consecutive_frames = 0
@@ -955,12 +954,12 @@ class AssistantStateMachine:
                         should_exit_cruise = True
                         exit_reason = f"3D marker occluded ({now - self.marker_last_seen_time:.2f}s > 0.65s)"
                 elif self.cruise_source == "MINIMAP":
-                    if quest_bearing is None:
+                    if self.minimap_quest_bearing is None:
                         should_exit_cruise = True
                         exit_reason = "Minimap bearing lost"
-                    elif abs(math.degrees(quest_bearing)) > 35.0:
+                    elif abs(math.degrees(self.minimap_quest_bearing)) > 35.0:
                         should_exit_cruise = True
-                        exit_reason = f"Minimap bearing drifted ({abs(math.degrees(quest_bearing)):.1f} deg > 35 deg)"
+                        exit_reason = f"Minimap bearing drifted ({abs(math.degrees(self.minimap_quest_bearing)):.1f} deg > 35 deg)"
 
             if should_exit_cruise:
                 print(f"[NAV] Exiting CRUISE_LOCKED -> ALIGN: {exit_reason}")
@@ -1038,7 +1037,7 @@ class AssistantStateMachine:
                     return
 
                 # Case 2: 3D Marker off-screen, Minimap Quest Bearing Present
-                if quest_bearing is not None:
+                if self.minimap_quest_bearing is not None:
                     self.is_scanning_for_marker = False
                     self._set_lost_marker_phase("IDLE", "minimap bearing active")
                     self.lost_marker_start_time = 0.0
@@ -1054,7 +1053,7 @@ class AssistantStateMachine:
                         self.last_quest_v_pulse_time = now
                         print(f"[NAV] Quest marker occluded ({time_lost:.2f}s > {v_delay}s): dispatched 'V' pulse.")
 
-                    bearing_deg = abs(math.degrees(quest_bearing))
+                    bearing_deg = abs(math.degrees(self.minimap_quest_bearing))
                     if bearing_deg <= 20.0:
                         print(f"[NAV] Aligned with minimap bearing ({bearing_deg:.1f} deg <= 20 deg) -> CRUISE_LOCKED")
                         if self.logger:
@@ -1066,7 +1065,7 @@ class AssistantStateMachine:
                         self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
                         return
 
-                    pivot_dx, _ = self.steering.compute_minimap_pivot(quest_bearing, now)
+                    pivot_dx, _ = self.steering.compute_minimap_pivot(self.minimap_quest_bearing, now)
                     if pivot_dx != 0:
                         self.hid.move_mouse(pivot_dx, 0)
                     self._maybe_emit_telemetry(now, minimap_present, minimap_score, f_prompt=f_prompt_detected)
